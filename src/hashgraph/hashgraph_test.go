@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/mosaicnetworks/babble/src/common"
-	"github.com/mosaicnetworks/babble/src/crypto"
+	bkeys "github.com/mosaicnetworks/babble/src/crypto/keys"
 	"github.com/mosaicnetworks/babble/src/peers"
 	"github.com/sirupsen/logrus"
 )
@@ -22,22 +22,24 @@ var (
 )
 
 type TestNode struct {
-	ID     uint32
-	Pub    []byte
-	PubHex string
-	Key    *ecdsa.PrivateKey
-	Events []*Event
+	PubID    uint32
+	PubBytes []byte
+	PubHex   string
+	Key      *ecdsa.PrivateKey
+	Events   []*Event
 }
 
 func NewTestNode(key *ecdsa.PrivateKey) TestNode {
-	pub := crypto.FromECDSAPub(&key.PublicKey)
-	ID := common.Hash32(pub)
+	pubBytes := bkeys.FromPublicKey(&key.PublicKey)
+	pubID := bkeys.PublicKeyID(&key.PublicKey)
+	pubHex := bkeys.PublicKeyHex(&key.PublicKey)
+
 	node := TestNode{
-		ID:     ID,
-		Key:    key,
-		Pub:    pub,
-		PubHex: fmt.Sprintf("0x%X", pub),
-		Events: []*Event{},
+		PubID:    pubID,
+		PubBytes: pubBytes,
+		PubHex:   pubHex,
+		Key:      key,
+		Events:   []*Event{},
 	}
 	return node
 }
@@ -71,7 +73,7 @@ type play struct {
 }
 
 func testLogger(t testing.TB) *logrus.Entry {
-	return common.NewTestLogger(t).WithField("id", "test")
+	return common.NewTestEntry(t, common.TestLogLevel)
 }
 
 /* Initialisation functions */
@@ -84,10 +86,9 @@ func initHashgraphNodes(n int) ([]TestNode, map[string]string, *[]*Event, *peers
 	pirs := []*peers.Peer{}
 
 	for i := 0; i < n; i++ {
-		key, _ := crypto.GenerateECDSAKey()
-		pub := crypto.FromECDSAPub(&key.PublicKey)
-		pubHex := fmt.Sprintf("0x%X", pub)
-		p := peers.NewPeer(pubHex, "")
+		key, _ := bkeys.GenerateECDSAKey()
+		pubHex := bkeys.PublicKeyHex(&key.PublicKey)
+		p := peers.NewPeer(pubHex, "", "")
 		pirs = append(pirs, p)
 		keys[pubHex] = key
 		nodes = append(nodes, NewTestNode(key))
@@ -101,52 +102,48 @@ func initHashgraphNodes(n int) ([]TestNode, map[string]string, *[]*Event, *peers
 func playEvents(plays []play, nodes []TestNode, index map[string]string, orderedEvents *[]*Event) {
 	for _, p := range plays {
 		e := NewEvent(p.txPayload,
+			nil,
 			p.sigPayload,
 			[]string{index[p.selfParent], index[p.otherParent]},
-			nodes[p.to].Pub,
+			nodes[p.to].PubBytes,
 			p.index)
 		nodes[p.to].signAndAddEvent(e, p.name, index, orderedEvents)
 	}
 }
 
-func createHashgraph(db bool, orderedEvents *[]*Event, peerSet *peers.PeerSet, logger *logrus.Entry) *Hashgraph {
+func createHashgraph(db bool, orderedEvents *[]*Event, peerSet *peers.PeerSet, t testing.TB) *Hashgraph {
 	var store Store
 	if db {
 		var err error
-		store, err = NewBadgerStore(cacheSize, badgerDir)
+		store, err = NewBadgerStore(cacheSize, badgerDir, false, nil)
 		if err != nil {
-			logger.Fatal(err)
+			t.Fatal(err)
 		}
 	} else {
 		store = NewInmemStore(cacheSize)
 	}
 
-	hashgraph := NewHashgraph(store, DummyInternalCommitCallback, logger)
+	hashgraph := NewHashgraph(store, DummyInternalCommitCallback, testLogger(t))
 
 	if err := hashgraph.Init(peerSet); err != nil {
-		fmt.Printf("ERROR initializing Hashgraph: %s\n", err)
+		t.Fatalf("ERROR initializing Hashgraph: %s\n", err)
 	}
 
 	for i, ev := range *orderedEvents {
 		if err := hashgraph.InsertEvent(ev, true); err != nil {
-			fmt.Printf("ERROR inserting event %d: %s\n", i, err)
+			t.Fatalf("ERROR inserting event %d: %s\n", i, err)
 		}
 	}
 
 	return hashgraph
 }
 
-func initHashgraphFull(plays []play, db bool, n int, logger *logrus.Entry) (*Hashgraph, map[string]string, *[]*Event) {
+func initHashgraphFull(plays []play, db bool, n int, t testing.TB) (*Hashgraph, map[string]string, *[]*Event) {
 	nodes, index, orderedEvents, peerSet := initHashgraphNodes(n)
-
-	for i, n := range nodes {
-		event := NewEvent(nil, nil, []string{rootSelfParent(n.ID), ""}, n.Pub, 0)
-		n.signAndAddEvent(event, fmt.Sprintf("e%d", i), index, orderedEvents)
-	}
 
 	playEvents(plays, nodes, index, orderedEvents)
 
-	hashgraph := createHashgraph(db, orderedEvents, peerSet, logger)
+	hashgraph := createHashgraph(db, orderedEvents, peerSet, t)
 
 	return hashgraph, index, orderedEvents
 }
@@ -169,29 +166,18 @@ e0  e1  e2
 */
 func initHashgraph(t *testing.T) (*Hashgraph, map[string]string) {
 	plays := []play{
-		play{0, 1, "e0", "e1", "e01", nil, nil},
-		play{2, 1, "e2", "", "s20", nil, nil},
-		play{1, 1, "e1", "", "s10", nil, nil},
-		play{0, 2, "e01", "", "s00", nil, nil},
-		play{2, 2, "s20", "s00", "e20", nil, nil},
-		play{1, 2, "s10", "e20", "e12", nil, nil},
+		{0, 0, "", "", "e0", nil, nil},
+		{1, 0, "", "", "e1", nil, nil},
+		{2, 0, "", "", "e2", nil, nil},
+		{0, 1, "e0", "e1", "e01", nil, nil},
+		{2, 1, "e2", "", "s20", nil, nil},
+		{1, 1, "e1", "", "s10", nil, nil},
+		{0, 2, "e01", "", "s00", nil, nil},
+		{2, 2, "s20", "s00", "e20", nil, nil},
+		{1, 2, "s10", "e20", "e12", nil, nil},
 	}
 
-	h, index, orderedEvents := initHashgraphFull(plays, false, n, testLogger(t))
-
-	for i, ev := range *orderedEvents {
-		if err := h.initEventCoordinates(ev); err != nil {
-			t.Fatalf("%d: %s", i, err)
-		}
-
-		if err := h.Store.SetEvent(ev); err != nil {
-			t.Fatalf("%d: %s", i, err)
-		}
-
-		if err := h.updateAncestorFirstDescendant(ev); err != nil {
-			t.Fatalf("%d: %s", i, err)
-		}
-	}
+	h, index, _ := initHashgraphFull(plays, false, n, t)
 
 	return h, index
 }
@@ -201,35 +187,35 @@ func TestAncestor(t *testing.T) {
 
 	expected := []ancestryItem{
 		//first generation
-		ancestryItem{"e01", "e0", true, false},
-		ancestryItem{"e01", "e1", true, false},
-		ancestryItem{"s00", "e01", true, false},
-		ancestryItem{"s20", "e2", true, false},
-		ancestryItem{"e20", "s00", true, false},
-		ancestryItem{"e20", "s20", true, false},
-		ancestryItem{"e12", "e20", true, false},
-		ancestryItem{"e12", "s10", true, false},
+		{"e01", "e0", true, false},
+		{"e01", "e1", true, false},
+		{"s00", "e01", true, false},
+		{"s20", "e2", true, false},
+		{"e20", "s00", true, false},
+		{"e20", "s20", true, false},
+		{"e12", "e20", true, false},
+		{"e12", "s10", true, false},
 		//second generation
-		ancestryItem{"s00", "e0", true, false},
-		ancestryItem{"s00", "e1", true, false},
-		ancestryItem{"e20", "e01", true, false},
-		ancestryItem{"e20", "e2", true, false},
-		ancestryItem{"e12", "e1", true, false},
-		ancestryItem{"e12", "s20", true, false},
+		{"s00", "e0", true, false},
+		{"s00", "e1", true, false},
+		{"e20", "e01", true, false},
+		{"e20", "e2", true, false},
+		{"e12", "e1", true, false},
+		{"e12", "s20", true, false},
 		//third generation
-		ancestryItem{"e20", "e0", true, false},
-		ancestryItem{"e20", "e1", true, false},
-		ancestryItem{"e20", "e2", true, false},
-		ancestryItem{"e12", "e01", true, false},
-		ancestryItem{"e12", "e0", true, false},
-		ancestryItem{"e12", "e1", true, false},
-		ancestryItem{"e12", "e2", true, false},
+		{"e20", "e0", true, false},
+		{"e20", "e1", true, false},
+		{"e20", "e2", true, false},
+		{"e12", "e01", true, false},
+		{"e12", "e0", true, false},
+		{"e12", "e1", true, false},
+		{"e12", "e2", true, false},
 		//false positive
-		ancestryItem{"e01", "e2", false, false},
-		ancestryItem{"s00", "e2", false, false},
-		ancestryItem{"e0", "", false, true},
-		ancestryItem{"s00", "", false, true},
-		ancestryItem{"e12", "", false, true},
+		{"e01", "e2", false, false},
+		{"s00", "e2", false, false},
+		{"e0", "", false, true},
+		{"s00", "", false, true},
+		{"e12", "", false, true},
 	}
 
 	for _, exp := range expected {
@@ -248,20 +234,20 @@ func TestSelfAncestor(t *testing.T) {
 
 	expected := []ancestryItem{
 		//1 generation
-		ancestryItem{"e01", "e0", true, false},
-		ancestryItem{"s00", "e01", true, false},
+		{"e01", "e0", true, false},
+		{"s00", "e01", true, false},
 		//1 generation false negative
-		ancestryItem{"e01", "e1", false, false},
-		ancestryItem{"e12", "e20", false, false},
-		ancestryItem{"s20", "e1", false, false},
-		ancestryItem{"s20", "", false, true},
+		{"e01", "e1", false, false},
+		{"e12", "e20", false, false},
+		{"s20", "e1", false, false},
+		{"s20", "", false, true},
 		//2 generations
-		ancestryItem{"e20", "e2", true, false},
-		ancestryItem{"e12", "e1", true, false},
+		{"e20", "e2", true, false},
+		{"e12", "e1", true, false},
 		//2 generations false negatives
-		ancestryItem{"e20", "e0", false, false},
-		ancestryItem{"e12", "e2", false, false},
-		ancestryItem{"e20", "e01", false, false},
+		{"e20", "e0", false, false},
+		{"e12", "e2", false, false},
+		{"e20", "e01", false, false},
 	}
 
 	for _, exp := range expected {
@@ -279,14 +265,14 @@ func TestSee(t *testing.T) {
 	h, index := initHashgraph(t)
 
 	expected := []ancestryItem{
-		ancestryItem{"e01", "e0", true, false},
-		ancestryItem{"e01", "e1", true, false},
-		ancestryItem{"e20", "e0", true, false},
-		ancestryItem{"e20", "e01", true, false},
-		ancestryItem{"e12", "e01", true, false},
-		ancestryItem{"e12", "e0", true, false},
-		ancestryItem{"e12", "e1", true, false},
-		ancestryItem{"e12", "s20", true, false},
+		{"e01", "e0", true, false},
+		{"e01", "e1", true, false},
+		{"e20", "e0", true, false},
+		{"e20", "e01", true, false},
+		{"e12", "e01", true, false},
+		{"e12", "e0", true, false},
+		{"e12", "e1", true, false},
+		{"e12", "s20", true, false},
 	}
 
 	for _, exp := range expected {
@@ -349,10 +335,10 @@ func TestFork(t *testing.T) {
 	pirs := []*peers.Peer{}
 
 	for i := 0; i < n; i++ {
-		key, _ := crypto.GenerateECDSAKey()
+		key, _ := bkeys.GenerateECDSAKey()
 		node := NewTestNode(key)
 		nodes = append(nodes, node)
-		pirs = append(pirs, peers.NewPeer(node.PubHex, ""))
+		pirs = append(pirs, peers.NewPeer(node.PubHex, "", ""))
 	}
 
 	peerSet := peers.NewPeerSet(pirs)
@@ -362,32 +348,32 @@ func TestFork(t *testing.T) {
 	hashgraph.Init(peerSet)
 
 	for i, node := range nodes {
-		event := NewEvent(nil, nil, []string{"", ""}, node.Pub, 0)
+		event := NewEvent(nil, nil, nil, []string{"", ""}, node.PubBytes, 0)
 		event.Sign(node.Key)
 		index[fmt.Sprintf("e%d", i)] = event.Hex()
 		hashgraph.InsertEvent(event, true)
 	}
 
 	//a and e2 need to have different hashes
-	eventA := NewEvent([][]byte{[]byte("yo")}, nil, []string{"", ""}, nodes[2].Pub, 0)
+	eventA := NewEvent([][]byte{[]byte("yo")}, nil, nil, []string{"", ""}, nodes[2].PubBytes, 0)
 	eventA.Sign(nodes[2].Key)
 	index["a"] = eventA.Hex()
 	if err := hashgraph.InsertEvent(eventA, true); err == nil {
 		t.Fatal("InsertEvent should return error for 'a'")
 	}
 
-	event01 := NewEvent(nil, nil,
+	event01 := NewEvent(nil, nil, nil,
 		[]string{index["e0"], index["a"]}, //e0 and a
-		nodes[0].Pub, 1)
+		nodes[0].PubBytes, 1)
 	event01.Sign(nodes[0].Key)
 	index["e01"] = event01.Hex()
 	if err := hashgraph.InsertEvent(event01, true); err == nil {
 		t.Fatal("InsertEvent should return error for e01")
 	}
 
-	event20 := NewEvent(nil, nil,
+	event20 := NewEvent(nil, nil, nil,
 		[]string{index["e2"], index["e01"]}, //e2 and e01
-		nodes[2].Pub, 1)
+		nodes[2].PubBytes, 1)
 	event20.Sign(nodes[2].Key)
 	index["e20"] = event20.Hex()
 	if err := hashgraph.InsertEvent(event20, true); err == nil {
@@ -416,27 +402,30 @@ e0  e1  e2
 
 func initRoundHashgraph(t *testing.T) (*Hashgraph, map[string]string) {
 	plays := []play{
-		play{1, 1, "e1", "e0", "e10", nil, nil},
-		play{2, 1, "e2", "", "s20", nil, nil},
-		play{0, 1, "e0", "", "s00", nil, nil},
-		play{2, 2, "s20", "e10", "e21", nil, nil},
-		play{0, 2, "s00", "e21", "e02", nil, nil},
-		play{1, 2, "e10", "", "s10", nil, nil},
-		play{1, 3, "s10", "e02", "f1", nil, nil},
-		play{1, 4, "f1", "", "s11", [][]byte{[]byte("abc")}, nil},
+		{0, 0, "", "", "e0", nil, nil},
+		{1, 0, "", "", "e1", nil, nil},
+		{2, 0, "", "", "e2", nil, nil},
+		{1, 1, "e1", "e0", "e10", nil, nil},
+		{2, 1, "e2", "", "s20", nil, nil},
+		{0, 1, "e0", "", "s00", nil, nil},
+		{2, 2, "s20", "e10", "e21", nil, nil},
+		{0, 2, "s00", "e21", "e02", nil, nil},
+		{1, 2, "e10", "", "s10", nil, nil},
+		{1, 3, "s10", "e02", "f1", nil, nil},
+		{1, 4, "f1", "", "s11", [][]byte{[]byte("abc")}, nil},
 	}
 
-	h, index, _ := initHashgraphFull(plays, false, n, testLogger(t))
+	h, index, _ := initHashgraphFull(plays, false, n, t)
 
 	//Set Rounds manually; this would normally be handled by DivideRounds()
 	round0Witnesses := make(map[string]RoundEvent)
-	round0Witnesses[index["e0"]] = RoundEvent{Witness: true, Famous: Undefined}
-	round0Witnesses[index["e1"]] = RoundEvent{Witness: true, Famous: Undefined}
-	round0Witnesses[index["e2"]] = RoundEvent{Witness: true, Famous: Undefined}
+	round0Witnesses[index["e0"]] = RoundEvent{Witness: true, Famous: common.Undefined}
+	round0Witnesses[index["e1"]] = RoundEvent{Witness: true, Famous: common.Undefined}
+	round0Witnesses[index["e2"]] = RoundEvent{Witness: true, Famous: common.Undefined}
 	h.Store.SetRound(0, &RoundInfo{CreatedEvents: round0Witnesses})
 
 	round1Witnesses := make(map[string]RoundEvent)
-	round1Witnesses[index["f1"]] = RoundEvent{Witness: true, Famous: Undefined}
+	round1Witnesses[index["f1"]] = RoundEvent{Witness: true, Famous: common.Undefined}
 	h.Store.SetRound(1, &RoundInfo{CreatedEvents: round1Witnesses})
 
 	return h, index
@@ -622,23 +611,23 @@ func TestStronglySee(t *testing.T) {
 	h, index := initRoundHashgraph(t)
 
 	expected := []ancestryItem{
-		ancestryItem{"e21", "e0", true, false},
-		ancestryItem{"e02", "e10", true, false},
-		ancestryItem{"e02", "e0", true, false},
-		ancestryItem{"e02", "e1", true, false},
-		ancestryItem{"f1", "e21", true, false},
-		ancestryItem{"f1", "e10", true, false},
-		ancestryItem{"f1", "e0", true, false},
-		ancestryItem{"f1", "e1", true, false},
-		ancestryItem{"f1", "e2", true, false},
-		ancestryItem{"s11", "e2", true, false},
+		{"e21", "e0", true, false},
+		{"e02", "e10", true, false},
+		{"e02", "e0", true, false},
+		{"e02", "e1", true, false},
+		{"f1", "e21", true, false},
+		{"f1", "e10", true, false},
+		{"f1", "e0", true, false},
+		{"f1", "e1", true, false},
+		{"f1", "e2", true, false},
+		{"s11", "e2", true, false},
 		//false negatives
-		ancestryItem{"e10", "e0", false, false},
-		ancestryItem{"e21", "e1", false, false},
-		ancestryItem{"e21", "e2", false, false},
-		ancestryItem{"e02", "e2", false, false},
-		ancestryItem{"s11", "e02", false, false},
-		ancestryItem{"s11", "", false, true},
+		{"e10", "e0", false, false},
+		{"e21", "e1", false, false},
+		{"e21", "e2", false, false},
+		{"e02", "e2", false, false},
+		{"s11", "e02", false, false},
+		{"s11", "", false, true},
 	}
 
 	peerSet, err := h.Store.GetPeerSet(0)
@@ -661,13 +650,13 @@ func TestWitness(t *testing.T) {
 	h, index := initRoundHashgraph(t)
 
 	expected := []ancestryItem{
-		ancestryItem{"", "e0", true, false},
-		ancestryItem{"", "e1", true, false},
-		ancestryItem{"", "e2", true, false},
-		ancestryItem{"", "f1", true, false},
-		ancestryItem{"", "e10", false, false},
-		ancestryItem{"", "e21", false, false},
-		ancestryItem{"", "e02", false, false},
+		{"", "e0", true, false},
+		{"", "e1", true, false},
+		{"", "e2", true, false},
+		{"", "f1", true, false},
+		{"", "e10", false, false},
+		{"", "e21", false, false},
+		{"", "e02", false, false},
 	}
 
 	for _, exp := range expected {
@@ -685,17 +674,17 @@ func TestRound(t *testing.T) {
 	h, index := initRoundHashgraph(t)
 
 	expected := []roundItem{
-		roundItem{"e0", 0},
-		roundItem{"e1", 0},
-		roundItem{"e2", 0},
-		roundItem{"s00", 0},
-		roundItem{"e10", 0},
-		roundItem{"s20", 0},
-		roundItem{"e21", 0},
-		roundItem{"e02", 0},
-		roundItem{"s10", 0},
-		roundItem{"f1", 1},
-		roundItem{"s11", 1},
+		{"e0", 0},
+		{"e1", 0},
+		{"e2", 0},
+		{"s00", 0},
+		{"e10", 0},
+		{"s20", 0},
+		{"e21", 0},
+		{"e02", 0},
+		{"s10", 0},
+		{"f1", 1},
+		{"s11", 1},
 	}
 
 	for _, exp := range expected {
@@ -745,23 +734,23 @@ func TestDivideRounds(t *testing.T) {
 	}
 
 	expectedRounds := map[int]*RoundInfo{
-		0: &RoundInfo{
+		0: {
 			CreatedEvents: map[string]RoundEvent{
-				index["e0"]:  RoundEvent{Witness: true, Famous: Undefined},
-				index["e1"]:  RoundEvent{Witness: true, Famous: Undefined},
-				index["e2"]:  RoundEvent{Witness: true, Famous: Undefined},
-				index["e10"]: RoundEvent{Witness: false, Famous: Undefined},
-				index["s20"]: RoundEvent{Witness: false, Famous: Undefined},
-				index["e21"]: RoundEvent{Witness: false, Famous: Undefined},
-				index["s00"]: RoundEvent{Witness: false, Famous: Undefined},
-				index["e02"]: RoundEvent{Witness: false, Famous: Undefined},
-				index["s10"]: RoundEvent{Witness: false, Famous: Undefined},
+				index["e0"]:  {Witness: true, Famous: common.Undefined},
+				index["e1"]:  {Witness: true, Famous: common.Undefined},
+				index["e2"]:  {Witness: true, Famous: common.Undefined},
+				index["e10"]: {Witness: false, Famous: common.Undefined},
+				index["s20"]: {Witness: false, Famous: common.Undefined},
+				index["e21"]: {Witness: false, Famous: common.Undefined},
+				index["s00"]: {Witness: false, Famous: common.Undefined},
+				index["e02"]: {Witness: false, Famous: common.Undefined},
+				index["s10"]: {Witness: false, Famous: common.Undefined},
 			},
 		},
-		1: &RoundInfo{
+		1: {
 			CreatedEvents: map[string]RoundEvent{
-				index["f1"]:  RoundEvent{Witness: true, Famous: Undefined},
-				index["s11"]: RoundEvent{Witness: false, Famous: Undefined},
+				index["f1"]:  {Witness: true, Famous: common.Undefined},
+				index["s11"]: {Witness: false, Famous: common.Undefined},
 			},
 		},
 	}
@@ -783,11 +772,11 @@ func TestDivideRounds(t *testing.T) {
 	}
 
 	expectedPendingRounds := []*PendingRound{
-		&PendingRound{
+		{
 			Index:   0,
 			Decided: false,
 		},
-		&PendingRound{
+		{
 			Index:   1,
 			Decided: false,
 		},
@@ -803,17 +792,17 @@ func TestDivideRounds(t *testing.T) {
 		t, r int
 	}
 	expectedTimestamps := map[string]tr{
-		"e0":  tr{0, 0},
-		"e1":  tr{0, 0},
-		"e2":  tr{0, 0},
-		"s00": tr{1, 0},
-		"e10": tr{1, 0},
-		"s20": tr{1, 0},
-		"e21": tr{2, 0},
-		"e02": tr{3, 0},
-		"s10": tr{2, 0},
-		"f1":  tr{4, 1},
-		"s11": tr{5, 1},
+		"e0":  {0, 0},
+		"e1":  {0, 0},
+		"e2":  {0, 0},
+		"s00": {1, 0},
+		"e10": {1, 0},
+		"s20": {1, 0},
+		"e21": {2, 0},
+		"e02": {3, 0},
+		"s10": {2, 0},
+		"f1":  {4, 1},
+		"s11": {5, 1},
 	}
 
 	for e, et := range expectedTimestamps {
@@ -835,26 +824,18 @@ func TestCreateRoot(t *testing.T) {
 	h, index := initRoundHashgraph(t)
 	h.DivideRounds()
 
-	heads := map[string]RootEvent{}
-	pasts := map[string][]string{}
+	rootEventsMap := map[string][]string{}
 
-	heads["e0"], _ = h.createRootEvent(index["e0"])
-	pasts["e0"] = []string{"e0"}
-
-	heads["e02"], _ = h.createRootEvent(index["e02"])
-	pasts["e02"] = []string{"e02", "e0", "s00"}
-
-	heads["s10"], _ = h.createRootEvent(index["s10"])
-	pasts["s10"] = []string{"e1", "e10", "s10"}
-
-	heads["f1"], _ = h.createRootEvent(index["f1"])
-	pasts["f1"] = []string{"e1", "e10", "s10", "f1"}
+	rootEventsMap["e0"] = []string{"e0"}
+	rootEventsMap["e02"] = []string{"e0", "s00", "e02"}
+	rootEventsMap["s10"] = []string{"e1", "e10", "s10"}
+	rootEventsMap["f1"] = []string{"e1", "e10", "s10", "f1"}
 
 	expectedRoots := make(map[string]*Root)
-	for e, hd := range heads {
-		root := NewRoot(hd)
-		for _, s := range pasts[e] {
-			re, _ := h.createRootEvent(index[s])
+	for e, hd := range rootEventsMap {
+		root := NewRoot()
+		for _, s := range hd {
+			re, _ := h.createFrameEvent(index[s])
 			root.Insert(re)
 		}
 		expectedRoots[e] = root
@@ -895,8 +876,8 @@ e0  e1  e2    Block (0, 1)
 func initBlockHashgraph(t *testing.T) (*Hashgraph, []TestNode, map[string]string) {
 	nodes, index, orderedEvents, peerSet := initHashgraphNodes(n)
 
-	for i, peer := range peerSet.Peers {
-		event := NewEvent(nil, nil, []string{rootSelfParent(peer.ID()), ""}, nodes[i].Pub, 0)
+	for i := range peerSet.Peers {
+		event := NewEvent(nil, nil, nil, []string{"", ""}, nodes[i].PubBytes, 0)
 		nodes[i].signAndAddEvent(event, fmt.Sprintf("e%d", i), index, orderedEvents)
 	}
 
@@ -908,7 +889,11 @@ func initBlockHashgraph(t *testing.T) (*Hashgraph, []TestNode, map[string]string
 	block := NewBlock(0, 1,
 		[]byte("framehash"),
 		peerSet.Peers,
-		[][]byte{[]byte("block tx")})
+		[][]byte{[]byte("block tx")},
+		[]InternalTransaction{
+			NewInternalTransaction(PEER_ADD, *peers.NewPeer("peer1", "paris", "peer1")),
+			NewInternalTransaction(PEER_REMOVE, *peers.NewPeer("peer2", "london", "peer2")),
+		})
 
 	err := hashgraph.Store.SetBlock(block)
 	if err != nil {
@@ -951,16 +936,17 @@ func TestInsertEventsWithBlockSignatures(t *testing.T) {
 			0   1    2
 		*/
 		plays := []play{
-			play{1, 1, "e1", "e0", "e10", nil, []BlockSignature{blockSigs[1]}},
-			play{2, 1, "e2", "", "s20", nil, []BlockSignature{blockSigs[2]}},
-			play{0, 1, "e0", "", "s00", nil, []BlockSignature{blockSigs[0]}},
+			{1, 1, "e1", "e0", "e10", nil, []BlockSignature{blockSigs[1]}},
+			{2, 1, "e2", "", "s20", nil, []BlockSignature{blockSigs[2]}},
+			{0, 1, "e0", "", "s00", nil, []BlockSignature{blockSigs[0]}},
 		}
 
 		for _, p := range plays {
 			e := NewEvent(p.txPayload,
+				nil,
 				p.sigPayload,
 				[]string{index[p.selfParent], index[p.otherParent]},
-				nodes[p.to].Pub,
+				nodes[p.to].PubBytes,
 				p.index)
 			e.Sign(nodes[p.to].Key)
 			index[p.name] = e.Hex()
@@ -996,21 +982,22 @@ func TestInsertEventsWithBlockSignatures(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		block1 := NewBlock(1, 2, []byte("framehash"), peerSet.Peers, [][]byte{})
+		block1 := NewBlock(1, 2, []byte("framehash"), peerSet.Peers, [][]byte{}, []InternalTransaction{})
 		sig, _ := block1.Sign(nodes[2].Key)
 
 		//unknown block
 		unknownBlockSig := BlockSignature{
-			Validator: nodes[2].Pub,
+			Validator: nodes[2].PubBytes,
 			Index:     1,
 			Signature: sig.Signature,
 		}
 		p := play{2, 2, "s20", "e10", "e21", nil, []BlockSignature{unknownBlockSig}}
 
 		e := NewEvent(nil,
+			nil,
 			p.sigPayload,
 			[]string{index[p.selfParent], index[p.otherParent]},
-			nodes[p.to].Pub,
+			nodes[p.to].PubBytes,
 			p.index)
 		e.Sign(nodes[p.to].Key)
 		index[p.name] = e.Hex()
@@ -1032,16 +1019,17 @@ func TestInsertEventsWithBlockSignatures(t *testing.T) {
 
 		//wrong validator
 		//Validator should be same as Event creator (node 0)
-		key, _ := crypto.GenerateECDSAKey()
+		key, _ := bkeys.GenerateECDSAKey()
 		badNode := NewTestNode(key)
 		badNodeSig, _ := block.Sign(badNode.Key)
 
 		p := play{0, 2, "s00", "e21", "e02", nil, []BlockSignature{badNodeSig}}
 
 		e := NewEvent(nil,
+			nil,
 			p.sigPayload,
 			[]string{index[p.selfParent], index[p.otherParent]},
-			nodes[p.to].Pub,
+			nodes[p.to].PubBytes,
 			p.index)
 		e.Sign(nodes[p.to].Key)
 		index[p.name] = e.Hex()
@@ -1118,37 +1106,40 @@ func TestInsertEventsWithBlockSignatures(t *testing.T) {
 */
 func initConsensusHashgraph(db bool, t testing.TB) (*Hashgraph, map[string]string) {
 	plays := []play{
-		play{1, 1, "e1", "e0", "e10", nil, nil},
-		play{2, 1, "e2", "e10", "e21", [][]byte{[]byte("e21")}, nil},
-		play{2, 2, "e21", "", "e21b", nil, nil},
-		play{0, 1, "e0", "e21b", "e02", nil, nil},
-		play{1, 2, "e10", "e02", "f1", nil, nil},
-		play{1, 3, "f1", "", "f1b", [][]byte{[]byte("f1b")}, nil},
-		play{0, 2, "e02", "f1b", "f0", nil, nil},
-		play{2, 3, "e21b", "f1b", "f2", nil, nil},
-		play{1, 4, "f1b", "f0", "f10", nil, nil},
-		play{0, 3, "f0", "e21", "f0x", nil, nil},
-		play{2, 4, "f2", "f10", "f21", nil, nil},
-		play{0, 4, "f0x", "f21", "f02", nil, nil},
-		play{0, 5, "f02", "", "f02b", [][]byte{[]byte("f02b")}, nil},
-		play{1, 5, "f10", "f02b", "g1", nil, nil},
-		play{0, 6, "f02b", "g1", "g0", nil, nil},
-		play{2, 5, "f21", "g1", "g2", nil, nil},
-		play{1, 6, "g1", "g0", "g10", [][]byte{[]byte("g10")}, nil},
-		play{2, 6, "g2", "g10", "g21", nil, nil},
-		play{0, 7, "g0", "g21", "g02", [][]byte{[]byte("g02")}, nil},
-		play{1, 7, "g10", "g02", "h1", nil, nil},
-		play{0, 8, "g02", "h1", "h0", nil, nil},
-		play{2, 7, "g21", "h1", "h2", nil, nil},
-		play{1, 8, "h1", "h0", "h10", nil, nil},
-		play{2, 8, "h2", "h10", "h21", nil, nil},
-		play{0, 9, "h0", "h21", "h02", nil, nil},
-		play{1, 9, "h10", "h02", "i1", nil, nil},
-		play{0, 10, "h02", "i1", "i0", nil, nil},
-		play{2, 9, "h21", "i1", "i2", nil, nil},
+		{0, 0, "", "", "e0", nil, nil},
+		{1, 0, "", "", "e1", nil, nil},
+		{2, 0, "", "", "e2", nil, nil},
+		{1, 1, "e1", "e0", "e10", nil, nil},
+		{2, 1, "e2", "e10", "e21", [][]byte{[]byte("e21")}, nil},
+		{2, 2, "e21", "", "e21b", nil, nil},
+		{0, 1, "e0", "e21b", "e02", nil, nil},
+		{1, 2, "e10", "e02", "f1", nil, nil},
+		{1, 3, "f1", "", "f1b", [][]byte{[]byte("f1b")}, nil},
+		{0, 2, "e02", "f1b", "f0", nil, nil},
+		{2, 3, "e21b", "f1b", "f2", nil, nil},
+		{1, 4, "f1b", "f0", "f10", nil, nil},
+		{0, 3, "f0", "e21", "f0x", nil, nil},
+		{2, 4, "f2", "f10", "f21", nil, nil},
+		{0, 4, "f0x", "f21", "f02", nil, nil},
+		{0, 5, "f02", "", "f02b", [][]byte{[]byte("f02b")}, nil},
+		{1, 5, "f10", "f02b", "g1", nil, nil},
+		{0, 6, "f02b", "g1", "g0", nil, nil},
+		{2, 5, "f21", "g1", "g2", nil, nil},
+		{1, 6, "g1", "g0", "g10", [][]byte{[]byte("g10")}, nil},
+		{2, 6, "g2", "g10", "g21", nil, nil},
+		{0, 7, "g0", "g21", "g02", [][]byte{[]byte("g02")}, nil},
+		{1, 7, "g10", "g02", "h1", nil, nil},
+		{0, 8, "g02", "h1", "h0", nil, nil},
+		{2, 7, "g21", "h1", "h2", nil, nil},
+		{1, 8, "h1", "h0", "h10", nil, nil},
+		{2, 8, "h2", "h10", "h21", nil, nil},
+		{0, 9, "h0", "h21", "h02", nil, nil},
+		{1, 9, "h10", "h02", "i1", nil, nil},
+		{0, 10, "h02", "i1", "i0", nil, nil},
+		{2, 9, "h21", "i1", "i2", nil, nil},
 	}
 
-	hashgraph, index, _ := initHashgraphFull(plays, db, n, testLogger(t))
+	hashgraph, index, _ := initHashgraphFull(plays, db, n, t)
 
 	return hashgraph, index
 }
@@ -1161,46 +1152,46 @@ func TestDivideRoundsBis(t *testing.T) {
 	}
 
 	expectedCreatedEvents := map[int]map[string]RoundEvent{
-		0: map[string]RoundEvent{
-			index["e0"]:   RoundEvent{Witness: true, Famous: Undefined},
-			index["e1"]:   RoundEvent{Witness: true, Famous: Undefined},
-			index["e2"]:   RoundEvent{Witness: true, Famous: Undefined},
-			index["e10"]:  RoundEvent{Witness: false, Famous: Undefined},
-			index["e21"]:  RoundEvent{Witness: false, Famous: Undefined},
-			index["e21b"]: RoundEvent{Witness: false, Famous: Undefined},
-			index["e02"]:  RoundEvent{Witness: false, Famous: Undefined},
+		0: {
+			index["e0"]:   {Witness: true, Famous: common.Undefined},
+			index["e1"]:   {Witness: true, Famous: common.Undefined},
+			index["e2"]:   {Witness: true, Famous: common.Undefined},
+			index["e10"]:  {Witness: false, Famous: common.Undefined},
+			index["e21"]:  {Witness: false, Famous: common.Undefined},
+			index["e21b"]: {Witness: false, Famous: common.Undefined},
+			index["e02"]:  {Witness: false, Famous: common.Undefined},
 		},
-		1: map[string]RoundEvent{
-			index["f1"]:   RoundEvent{Witness: true, Famous: Undefined},
-			index["f1b"]:  RoundEvent{Witness: false, Famous: Undefined},
-			index["f0"]:   RoundEvent{Witness: true, Famous: Undefined},
-			index["f2"]:   RoundEvent{Witness: true, Famous: Undefined},
-			index["f10"]:  RoundEvent{Witness: false, Famous: Undefined},
-			index["f21"]:  RoundEvent{Witness: false, Famous: Undefined},
-			index["f0x"]:  RoundEvent{Witness: false, Famous: Undefined},
-			index["f02"]:  RoundEvent{Witness: false, Famous: Undefined},
-			index["f02b"]: RoundEvent{Witness: false, Famous: Undefined},
+		1: {
+			index["f1"]:   {Witness: true, Famous: common.Undefined},
+			index["f1b"]:  {Witness: false, Famous: common.Undefined},
+			index["f0"]:   {Witness: true, Famous: common.Undefined},
+			index["f2"]:   {Witness: true, Famous: common.Undefined},
+			index["f10"]:  {Witness: false, Famous: common.Undefined},
+			index["f21"]:  {Witness: false, Famous: common.Undefined},
+			index["f0x"]:  {Witness: false, Famous: common.Undefined},
+			index["f02"]:  {Witness: false, Famous: common.Undefined},
+			index["f02b"]: {Witness: false, Famous: common.Undefined},
 		},
-		2: map[string]RoundEvent{
-			index["g1"]:  RoundEvent{Witness: true, Famous: Undefined},
-			index["g0"]:  RoundEvent{Witness: true, Famous: Undefined},
-			index["g2"]:  RoundEvent{Witness: true, Famous: Undefined},
-			index["g10"]: RoundEvent{Witness: false, Famous: Undefined},
-			index["g21"]: RoundEvent{Witness: false, Famous: Undefined},
-			index["g02"]: RoundEvent{Witness: false, Famous: Undefined},
+		2: {
+			index["g1"]:  {Witness: true, Famous: common.Undefined},
+			index["g0"]:  {Witness: true, Famous: common.Undefined},
+			index["g2"]:  {Witness: true, Famous: common.Undefined},
+			index["g10"]: {Witness: false, Famous: common.Undefined},
+			index["g21"]: {Witness: false, Famous: common.Undefined},
+			index["g02"]: {Witness: false, Famous: common.Undefined},
 		},
-		3: map[string]RoundEvent{
-			index["h1"]:  RoundEvent{Witness: true, Famous: Undefined},
-			index["h0"]:  RoundEvent{Witness: true, Famous: Undefined},
-			index["h2"]:  RoundEvent{Witness: true, Famous: Undefined},
-			index["h10"]: RoundEvent{Witness: false, Famous: Undefined},
-			index["h21"]: RoundEvent{Witness: false, Famous: Undefined},
-			index["h02"]: RoundEvent{Witness: false, Famous: Undefined},
+		3: {
+			index["h1"]:  {Witness: true, Famous: common.Undefined},
+			index["h0"]:  {Witness: true, Famous: common.Undefined},
+			index["h2"]:  {Witness: true, Famous: common.Undefined},
+			index["h10"]: {Witness: false, Famous: common.Undefined},
+			index["h21"]: {Witness: false, Famous: common.Undefined},
+			index["h02"]: {Witness: false, Famous: common.Undefined},
 		},
-		4: map[string]RoundEvent{
-			index["i1"]: RoundEvent{Witness: true, Famous: Undefined},
-			index["i0"]: RoundEvent{Witness: true, Famous: Undefined},
-			index["i2"]: RoundEvent{Witness: true, Famous: Undefined},
+		4: {
+			index["i1"]: {Witness: true, Famous: common.Undefined},
+			index["i0"]: {Witness: true, Famous: common.Undefined},
+			index["i2"]: {Witness: true, Famous: common.Undefined},
 		},
 	}
 
@@ -1219,37 +1210,37 @@ func TestDivideRoundsBis(t *testing.T) {
 		t, r int
 	}
 	expectedTimestamps := map[string]tr{
-		"e0":   tr{0, 0},
-		"e1":   tr{0, 0},
-		"e2":   tr{0, 0},
-		"e10":  tr{1, 0},
-		"e21":  tr{2, 0},
-		"e21b": tr{3, 0},
-		"e02":  tr{4, 0},
-		"f1":   tr{5, 1},
-		"f1b":  tr{6, 1},
-		"f0":   tr{7, 1},
-		"f2":   tr{7, 1},
-		"f10":  tr{8, 1},
-		"f0x":  tr{8, 1},
-		"f21":  tr{9, 1},
-		"f02":  tr{10, 1},
-		"f02b": tr{11, 1},
-		"g1":   tr{12, 2},
-		"g0":   tr{13, 2},
-		"g2":   tr{13, 2},
-		"g10":  tr{14, 2},
-		"g21":  tr{15, 2},
-		"g02":  tr{16, 2},
-		"h1":   tr{17, 3},
-		"h0":   tr{18, 3},
-		"h2":   tr{18, 3},
-		"h10":  tr{19, 3},
-		"h21":  tr{20, 3},
-		"h02":  tr{21, 3},
-		"i1":   tr{22, 4},
-		"i0":   tr{23, 4},
-		"i2":   tr{23, 4},
+		"e0":   {0, 0},
+		"e1":   {0, 0},
+		"e2":   {0, 0},
+		"e10":  {1, 0},
+		"e21":  {2, 0},
+		"e21b": {3, 0},
+		"e02":  {4, 0},
+		"f1":   {5, 1},
+		"f1b":  {6, 1},
+		"f0":   {7, 1},
+		"f2":   {7, 1},
+		"f10":  {8, 1},
+		"f0x":  {8, 1},
+		"f21":  {9, 1},
+		"f02":  {10, 1},
+		"f02b": {11, 1},
+		"g1":   {12, 2},
+		"g0":   {13, 2},
+		"g2":   {13, 2},
+		"g10":  {14, 2},
+		"g21":  {15, 2},
+		"g02":  {16, 2},
+		"h1":   {17, 3},
+		"h0":   {18, 3},
+		"h2":   {18, 3},
+		"h10":  {19, 3},
+		"h21":  {20, 3},
+		"h02":  {21, 3},
+		"i1":   {22, 4},
+		"i0":   {23, 4},
+		"i2":   {23, 4},
 	}
 
 	for e, et := range expectedTimestamps {
@@ -1276,46 +1267,46 @@ func TestDecideFame(t *testing.T) {
 	}
 
 	expectedCreatedEvents := map[int]map[string]RoundEvent{
-		0: map[string]RoundEvent{
-			index["e0"]:   RoundEvent{Witness: true, Famous: True},
-			index["e1"]:   RoundEvent{Witness: true, Famous: True},
-			index["e2"]:   RoundEvent{Witness: true, Famous: True},
-			index["e10"]:  RoundEvent{Witness: false, Famous: Undefined},
-			index["e21"]:  RoundEvent{Witness: false, Famous: Undefined},
-			index["e21b"]: RoundEvent{Witness: false, Famous: Undefined},
-			index["e02"]:  RoundEvent{Witness: false, Famous: Undefined},
+		0: {
+			index["e0"]:   {Witness: true, Famous: common.True},
+			index["e1"]:   {Witness: true, Famous: common.True},
+			index["e2"]:   {Witness: true, Famous: common.True},
+			index["e10"]:  {Witness: false, Famous: common.Undefined},
+			index["e21"]:  {Witness: false, Famous: common.Undefined},
+			index["e21b"]: {Witness: false, Famous: common.Undefined},
+			index["e02"]:  {Witness: false, Famous: common.Undefined},
 		},
-		1: map[string]RoundEvent{
-			index["f1"]:   RoundEvent{Witness: true, Famous: True},
-			index["f1b"]:  RoundEvent{Witness: false, Famous: Undefined},
-			index["f0"]:   RoundEvent{Witness: true, Famous: True},
-			index["f2"]:   RoundEvent{Witness: true, Famous: True},
-			index["f10"]:  RoundEvent{Witness: false, Famous: Undefined},
-			index["f21"]:  RoundEvent{Witness: false, Famous: Undefined},
-			index["f0x"]:  RoundEvent{Witness: false, Famous: Undefined},
-			index["f02"]:  RoundEvent{Witness: false, Famous: Undefined},
-			index["f02b"]: RoundEvent{Witness: false, Famous: Undefined},
+		1: {
+			index["f1"]:   {Witness: true, Famous: common.True},
+			index["f1b"]:  {Witness: false, Famous: common.Undefined},
+			index["f0"]:   {Witness: true, Famous: common.True},
+			index["f2"]:   {Witness: true, Famous: common.True},
+			index["f10"]:  {Witness: false, Famous: common.Undefined},
+			index["f21"]:  {Witness: false, Famous: common.Undefined},
+			index["f0x"]:  {Witness: false, Famous: common.Undefined},
+			index["f02"]:  {Witness: false, Famous: common.Undefined},
+			index["f02b"]: {Witness: false, Famous: common.Undefined},
 		},
-		2: map[string]RoundEvent{
-			index["g1"]:  RoundEvent{Witness: true, Famous: True},
-			index["g0"]:  RoundEvent{Witness: true, Famous: True},
-			index["g2"]:  RoundEvent{Witness: true, Famous: True},
-			index["g10"]: RoundEvent{Witness: false, Famous: Undefined},
-			index["g21"]: RoundEvent{Witness: false, Famous: Undefined},
-			index["g02"]: RoundEvent{Witness: false, Famous: Undefined},
+		2: {
+			index["g1"]:  {Witness: true, Famous: common.True},
+			index["g0"]:  {Witness: true, Famous: common.True},
+			index["g2"]:  {Witness: true, Famous: common.True},
+			index["g10"]: {Witness: false, Famous: common.Undefined},
+			index["g21"]: {Witness: false, Famous: common.Undefined},
+			index["g02"]: {Witness: false, Famous: common.Undefined},
 		},
-		3: map[string]RoundEvent{
-			index["h1"]:  RoundEvent{Witness: true, Famous: Undefined},
-			index["h0"]:  RoundEvent{Witness: true, Famous: Undefined},
-			index["h2"]:  RoundEvent{Witness: true, Famous: Undefined},
-			index["h10"]: RoundEvent{Witness: false, Famous: Undefined},
-			index["h21"]: RoundEvent{Witness: false, Famous: Undefined},
-			index["h02"]: RoundEvent{Witness: false, Famous: Undefined},
+		3: {
+			index["h1"]:  {Witness: true, Famous: common.Undefined},
+			index["h0"]:  {Witness: true, Famous: common.Undefined},
+			index["h2"]:  {Witness: true, Famous: common.Undefined},
+			index["h10"]: {Witness: false, Famous: common.Undefined},
+			index["h21"]: {Witness: false, Famous: common.Undefined},
+			index["h02"]: {Witness: false, Famous: common.Undefined},
 		},
-		4: map[string]RoundEvent{
-			index["i1"]: RoundEvent{Witness: true, Famous: Undefined},
-			index["i0"]: RoundEvent{Witness: true, Famous: Undefined},
-			index["i2"]: RoundEvent{Witness: true, Famous: Undefined},
+		4: {
+			index["i1"]: {Witness: true, Famous: common.Undefined},
+			index["i0"]: {Witness: true, Famous: common.Undefined},
+			index["i2"]: {Witness: true, Famous: common.Undefined},
 		},
 	}
 
@@ -1330,23 +1321,23 @@ func TestDecideFame(t *testing.T) {
 	}
 
 	expectedpendingRounds := []*PendingRound{
-		&PendingRound{
+		{
 			Index:   0,
 			Decided: true,
 		},
-		&PendingRound{
+		{
 			Index:   1,
 			Decided: true,
 		},
-		&PendingRound{
+		{
 			Index:   2,
 			Decided: true,
 		},
-		&PendingRound{
+		{
 			Index:   3,
 			Decided: false,
 		},
-		&PendingRound{
+		{
 			Index:   4,
 			Decided: false,
 		},
@@ -1372,11 +1363,11 @@ func TestDecideRoundReceived(t *testing.T) {
 	}
 
 	expectedReceivedEvents := map[int][]string{
-		0: []string{},
-		1: []string{index["e0"], index["e1"], index["e2"], index["e10"], index["e21"], index["e21b"], index["e02"]},
-		2: []string{index["f1"], index["f1b"], index["f0"], index["f2"], index["f10"], index["f0x"], index["f21"], index["f02"], index["f02b"]},
-		3: []string{},
-		4: []string{},
+		0: {},
+		1: {index["e0"], index["e1"], index["e2"], index["e10"], index["e21"], index["e21b"], index["e02"]},
+		2: {index["f1"], index["f1b"], index["f0"], index["f2"], index["f10"], index["f0x"], index["f21"], index["f02"], index["f02b"]},
+		3: {},
+		4: {},
 	}
 
 	for i := 0; i < 5; i++ {
@@ -1475,8 +1466,8 @@ func TestProcessDecidedRounds(t *testing.T) {
 		t.Fatalf("Block0.Transactions[0] should be 'e21', not %s", tx)
 	}
 
-	frame1, err := h.GetFrame(block0.RoundReceived())
-	frame1Hash, err := frame1.Hash()
+	frame1, _ := h.GetFrame(block0.RoundReceived())
+	frame1Hash, _ := frame1.Hash()
 	if !reflect.DeepEqual(block0.FrameHash(), frame1Hash) {
 		t.Fatalf("Block0.FrameHash should be %v, not %v", frame1Hash, block0.FrameHash())
 	}
@@ -1502,19 +1493,19 @@ func TestProcessDecidedRounds(t *testing.T) {
 		t.Fatalf("Block1.Transactions[1] should be 'f02b', not %s", tx)
 	}
 
-	frame2, err := h.GetFrame(block1.RoundReceived())
-	frame2Hash, err := frame2.Hash()
+	frame2, _ := h.GetFrame(block1.RoundReceived())
+	frame2Hash, _ := frame2.Hash()
 	if !reflect.DeepEqual(block1.FrameHash(), frame2Hash) {
 		t.Fatalf("Block1.FrameHash should be %v, not %v", frame2Hash, block1.FrameHash())
 	}
 
 	// pendingRounds -----------------------------------------------------------
 	expectedpendingRounds := []*PendingRound{
-		&PendingRound{
+		{
 			Index:   3,
 			Decided: false,
 		},
-		&PendingRound{
+		{
 			Index:   4,
 			Decided: false,
 		},
@@ -1577,22 +1568,9 @@ func TestGetFrame(t *testing.T) {
 	t.Run("Round 1", func(t *testing.T) {
 		expectedRoots := make(map[string]*Root, n)
 
-		root0 := NewBaseRoot(peerSet.IDs()[0])
-		root0.Precomputed[index["e0"]], _ = h.createRootEvent(index["e0"])
-		root0.Precomputed[index["e02"]], _ = h.createRootEvent(index["e02"])
-
-		root1 := NewBaseRoot(peerSet.IDs()[1])
-		root1.Precomputed[index["e1"]], _ = h.createRootEvent(index["e1"])
-		root1.Precomputed[index["e10"]], _ = h.createRootEvent(index["e10"])
-
-		root2 := NewBaseRoot(peerSet.IDs()[2])
-		root2.Precomputed[index["e2"]], _ = h.createRootEvent(index["e2"])
-		root2.Precomputed[index["e21"]], _ = h.createRootEvent(index["e21"])
-		root2.Precomputed[index["e21b"]], _ = h.createRootEvent(index["e21b"])
-
-		expectedRoots[peerSet.PubKeys()[0]] = root0
-		expectedRoots[peerSet.PubKeys()[1]] = root1
-		expectedRoots[peerSet.PubKeys()[2]] = root2
+		expectedRoots[peerSet.PubKeys()[0]] = NewRoot()
+		expectedRoots[peerSet.PubKeys()[1]] = NewRoot()
+		expectedRoots[peerSet.PubKeys()[2]] = NewRoot()
 
 		frame, err := h.GetFrame(1)
 		if err != nil {
@@ -1614,15 +1592,17 @@ func TestGetFrame(t *testing.T) {
 			index["e21"],
 			index["e21b"],
 			index["e02"]}
-		expectedEvents := []*Event{}
+
+		expectedEvents := []*FrameEvent{}
 		for _, eh := range expectedEventsHashes {
-			e, err := h.Store.GetEvent(eh)
+			e, err := h.createFrameEvent(eh)
 			if err != nil {
 				t.Fatal(err)
 			}
 			expectedEvents = append(expectedEvents, e)
 		}
-		sort.Sort(ByLamportTimestamp(expectedEvents))
+		sort.Sort(SortedFrameEvents(expectedEvents))
+
 		if !reflect.DeepEqual(expectedEvents, frame.Events) {
 			t.Fatal("Frame.Events is not good")
 		}
@@ -1631,44 +1611,35 @@ func TestGetFrame(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Store should contain a block with Index 1: %v", err)
 		}
+
 		frame1Hash, err := frame.Hash()
 		if err != nil {
 			t.Fatalf("Error computing Frame hash, %v", err)
 		}
+
 		if !reflect.DeepEqual(block0.FrameHash(), frame1Hash) {
 			t.Fatalf("Block0.FrameHash (%v) and Frame1.Hash (%v) differ", block0.FrameHash(), frame1Hash)
 		}
 	})
 
 	t.Run("Round 2", func(t *testing.T) {
-		heads := map[int]RootEvent{}
 		pasts := map[int][]string{}
-		precomps := map[int][]string{}
 
-		heads[0], _ = h.createRootEvent(index["e02"])
 		pasts[0] = []string{"e0", "e02"}
-		precomps[0] = []string{"f0", "f0x", "f02", "f02b"}
-
-		heads[1], _ = h.createRootEvent(index["e10"])
 		pasts[1] = []string{"e1", "e10"}
-		precomps[1] = []string{"f1", "f1b", "f10"}
-
-		heads[2], _ = h.createRootEvent(index["e21b"])
 		pasts[2] = []string{"e2", "e21", "e21b"}
-		precomps[2] = []string{"f2", "f21"}
 
 		expectedRoots := make(map[string]*Root)
 		for i := 0; i < 3; i++ {
-			root := NewRoot(heads[i])
-			for _, s := range pasts[i] {
-				re, _ := h.createRootEvent(index[s])
+			root := NewRoot()
+			for _, ev := range pasts[i] {
+				re, err := h.createFrameEvent(index[ev])
+				if err != nil {
+					t.Fatal(err)
+				}
 				root.Insert(re)
 			}
-			for _, s := range precomps[i] {
-				re, _ := h.createRootEvent(index[s])
-				root.Precomputed[re.Hash] = re
-			}
-			expectedRoots[peerSet.PubKeys()[i]] = root
+			expectedRoots[peerSet.Peers[i].PubKeyString()] = root
 		}
 
 		frame, err := h.GetFrame(2)
@@ -1693,15 +1664,17 @@ func TestGetFrame(t *testing.T) {
 			index["f21"],
 			index["f02"],
 			index["f02b"]}
-		expectedEvents := []*Event{}
+
+		expectedEvents := []*FrameEvent{}
 		for _, eh := range expectedEventsHashes {
-			e, err := h.Store.GetEvent(eh)
+			e, err := h.createFrameEvent(eh)
 			if err != nil {
 				t.Fatal(err)
 			}
 			expectedEvents = append(expectedEvents, e)
 		}
-		sort.Sort(ByLamportTimestamp(expectedEvents))
+		sort.Sort(SortedFrameEvents(expectedEvents))
+
 		if !reflect.DeepEqual(expectedEvents, frame.Events) {
 			t.Fatal("Frame.Events is not good")
 		}
@@ -1781,10 +1754,56 @@ func TestResetFromFrame(t *testing.T) {
 	}
 
 	/***************************************************************************
+	 Test StronglySee
+	***************************************************************************/
+	expected := []ancestryItem{
+		{"e02", "e0", true, false},
+		{"e02", "e1", true, false},
+		{"e21", "e0", true, false},
+		{"f1", "e0", true, false},
+		{"f1", "e1", true, false},
+		{"f1", "e2", true, false},
+		{"f1", "e1", true, false},
+		{"f1", "e2", true, false},
+	}
+
+	for _, exp := range expected {
+		a, err := h2.stronglySee(index[exp.descendant], index[exp.ancestor], peerSet)
+		if err != nil && !exp.err {
+			t.Fatalf("Error computing stronglySee(%s, %s). Err: %v", exp.descendant, exp.ancestor, err)
+		}
+		if a != exp.val {
+			t.Fatalf("stronglySee(%s, %s) should be %v, not %v", exp.descendant, exp.ancestor, exp.val, a)
+		}
+	}
+
+	/***************************************************************************
 	 Test DivideRounds
 	***************************************************************************/
-	if err := h2.DivideRounds(); err != nil {
-		t.Fatal(err)
+
+	//check Event Rounds and LamportTimestamps
+	for _, ev := range frame.Events {
+		evHex := ev.Core.Hex()
+
+		h2r, err := h2.round(evHex)
+		if err != nil {
+			t.Fatalf("Error computing %s Round: %d", getName(index, evHex), h2r)
+		}
+
+		hr, _ := h.round(evHex)
+		if h2r != hr {
+			t.Fatalf("h2[%v].Round should be %d, not %d", getName(index, evHex), hr, h2r)
+		}
+
+		h2s, err := h2.lamportTimestamp(evHex)
+		if err != nil {
+			t.Fatalf("Error computing %s LamportTimestamp: %d", getName(index, evHex), h2s)
+		}
+
+		hs, _ := h.lamportTimestamp(evHex)
+		if h2s != hs {
+			t.Fatalf("h2[%v].LamportTimestamp should be %d, not %d", getName(index, evHex), hs, h2s)
+		}
 	}
 
 	hRound1, err := h.Store.GetRound(1)
@@ -1802,38 +1821,24 @@ func TestResetFromFrame(t *testing.T) {
 	sort.Strings(hWitnesses)
 	sort.Strings(h2Witnesses)
 	if !reflect.DeepEqual(hWitnesses, h2Witnesses) {
-		t.Fatalf("Reset Hg Round 1 witnesses should be %v, not %v", hWitnesses, h2Witnesses)
-	}
+		hwnames := []string{}
+		h2wnames := []string{}
+		for _, w := range hWitnesses {
+			wn := getName(index, w)
+			hwnames = append(hwnames, wn)
 
-	//check Event Rounds and LamportTimestamps
-	for _, ev := range frame.Events {
-		h2r, err := h2.round(ev.Hex())
-		if err != nil {
-			t.Fatalf("Error computing %s Round: %d", getName(index, ev.Hex()), h2r)
 		}
-		hr, _ := h.round(ev.Hex())
-		if h2r != hr {
+		for _, w := range h2Witnesses {
+			wn := getName(index, w)
+			h2wnames = append(h2wnames, wn)
 
-			t.Fatalf("h2[%v].Round should be %d, not %d", getName(index, ev.Hex()), hr, h2r)
 		}
-
-		h2s, err := h2.lamportTimestamp(ev.Hex())
-		if err != nil {
-			t.Fatalf("Error computing %s LamportTimestamp: %d", getName(index, ev.Hex()), h2s)
-		}
-		hs, _ := h.lamportTimestamp(ev.Hex())
-		if h2s != hs {
-			t.Fatalf("h2[%v].LamportTimestamp should be %d, not %d", getName(index, ev.Hex()), hs, h2s)
-		}
+		t.Fatalf("Reset Hg Round 1 witnesses should be %v, not %v", hwnames, h2wnames)
 	}
 
 	/***************************************************************************
 	Test Consensus
 	***************************************************************************/
-	h2.DecideFame()
-	h2.DecideRoundReceived()
-	h2.ProcessDecidedRounds()
-
 	if lbi := h2.Store.LastBlockIndex(); lbi != block.Index() {
 		t.Fatalf("LastBlockIndex should be %d, not %d", block.Index(), lbi)
 	}
@@ -1869,28 +1874,15 @@ func TestResetFromFrame(t *testing.T) {
 		sort.Sort(ByTopologicalOrder(events))
 
 		for _, ev := range events {
-			marshalledEv, _ := ev.Marshal()
+			marshalledEv, _ := ev.MarshalDB()
 			unmarshalledEv := new(Event)
-			unmarshalledEv.Unmarshal(marshalledEv)
+			unmarshalledEv.UnmarshalDB(marshalledEv)
 
-			err = h2.InsertEvent(unmarshalledEv, true)
+			err = h2.InsertEventAndRunConsensus(unmarshalledEv, true)
 			if err != nil {
 				t.Fatalf("ERR Inserting Event %s: %v", getName(index, ev.Hex()), err)
 			}
 		}
-	}
-
-	if err := h2.DivideRounds(); err != nil {
-		t.Fatal(err)
-	}
-	if err := h2.DecideFame(); err != nil {
-		t.Fatal(err)
-	}
-	if err := h2.DecideRoundReceived(); err != nil {
-		t.Fatal(err)
-	}
-	if err := h2.ProcessDecidedRounds(); err != nil {
-		t.Fatal(err)
 	}
 
 	for r := 1; r <= 4; r++ {
@@ -1930,11 +1922,11 @@ func TestBootstrap(t *testing.T) {
 
 	//Now we want to create a new Hashgraph based on the database of the previous
 	//Hashgraph and see if we can boostrap it to the same state.
-	recycledStore, err := NewBadgerStore(cacheSize, badgerDir)
+	recycledStore, _ := NewBadgerStore(cacheSize, badgerDir, false, nil)
 
 	nh := NewHashgraph(recycledStore, DummyInternalCommitCallback, logrus.New().WithField("id", "bootstrapped"))
 
-	err = nh.Bootstrap()
+	err := nh.Bootstrap()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2033,59 +2025,59 @@ func TestBootstrap(t *testing.T) {
 	0	 1	  2	   3
 */
 
-func initFunkyHashgraph(logger *logrus.Logger, full bool) (*Hashgraph, map[string]string) {
+func initFunkyHashgraph(full bool, t testing.TB) (*Hashgraph, map[string]string) {
 	nodes, index, orderedEvents, participants := initHashgraphNodes(4)
 
-	for i, peer := range participants.Peers {
+	for i := range participants.Peers {
 		name := fmt.Sprintf("w0%d", i)
-		event := NewEvent([][]byte{[]byte(name)}, nil, []string{rootSelfParent(peer.ID()), ""}, nodes[i].Pub, 0)
+		event := NewEvent([][]byte{[]byte(name)}, nil, nil, []string{"", ""}, nodes[i].PubBytes, 0)
 		nodes[i].signAndAddEvent(event, name, index, orderedEvents)
 	}
 
 	plays := []play{
-		play{2, 1, "w02", "w03", "a23", [][]byte{[]byte("a23")}, nil},
-		play{1, 1, "w01", "a23", "a12", [][]byte{[]byte("a12")}, nil},
-		play{0, 1, "w00", "", "a00", [][]byte{[]byte("a00")}, nil},
-		play{1, 2, "a12", "a00", "a10", [][]byte{[]byte("a10")}, nil},
-		play{2, 2, "a23", "a12", "a21", [][]byte{[]byte("a21")}, nil},
-		play{3, 1, "w03", "a21", "w13", [][]byte{[]byte("w13")}, nil},
-		play{2, 3, "a21", "w13", "w12", [][]byte{[]byte("w12")}, nil},
-		play{1, 3, "a10", "w12", "w11", [][]byte{[]byte("w11")}, nil},
-		play{0, 2, "a00", "w11", "w10", [][]byte{[]byte("w10")}, nil},
-		play{2, 4, "w12", "w11", "b21", [][]byte{[]byte("b21")}, nil},
-		play{3, 2, "w13", "b21", "w23", [][]byte{[]byte("w23")}, nil},
-		play{1, 4, "w11", "w23", "w21", [][]byte{[]byte("w21")}, nil},
-		play{0, 3, "w10", "", "b00", [][]byte{[]byte("b00")}, nil},
-		play{1, 5, "w21", "b00", "c10", [][]byte{[]byte("c10")}, nil},
-		play{2, 5, "b21", "c10", "w22", [][]byte{[]byte("w22")}, nil},
-		play{0, 4, "b00", "w22", "w20", [][]byte{[]byte("w20")}, nil},
-		play{1, 6, "c10", "w20", "w31", [][]byte{[]byte("w31")}, nil},
-		play{2, 6, "w22", "w31", "w32", [][]byte{[]byte("w32")}, nil},
-		play{0, 5, "w20", "w32", "w30", [][]byte{[]byte("w30")}, nil},
-		play{3, 3, "w23", "w32", "w33", [][]byte{[]byte("w33")}, nil},
-		play{1, 7, "w31", "w33", "d13", [][]byte{[]byte("d13")}, nil},
-		play{0, 6, "w30", "d13", "w40", [][]byte{[]byte("w40")}, nil},
-		play{1, 8, "d13", "w40", "w41", [][]byte{[]byte("w41")}, nil},
-		play{2, 7, "w32", "w41", "w42", [][]byte{[]byte("w42")}, nil},
-		play{3, 4, "w33", "w42", "w43", [][]byte{[]byte("w43")}, nil},
+		{2, 1, "w02", "w03", "a23", [][]byte{[]byte("a23")}, nil},
+		{1, 1, "w01", "a23", "a12", [][]byte{[]byte("a12")}, nil},
+		{0, 1, "w00", "", "a00", [][]byte{[]byte("a00")}, nil},
+		{1, 2, "a12", "a00", "a10", [][]byte{[]byte("a10")}, nil},
+		{2, 2, "a23", "a12", "a21", [][]byte{[]byte("a21")}, nil},
+		{3, 1, "w03", "a21", "w13", [][]byte{[]byte("w13")}, nil},
+		{2, 3, "a21", "w13", "w12", [][]byte{[]byte("w12")}, nil},
+		{1, 3, "a10", "w12", "w11", [][]byte{[]byte("w11")}, nil},
+		{0, 2, "a00", "w11", "w10", [][]byte{[]byte("w10")}, nil},
+		{2, 4, "w12", "w11", "b21", [][]byte{[]byte("b21")}, nil},
+		{3, 2, "w13", "b21", "w23", [][]byte{[]byte("w23")}, nil},
+		{1, 4, "w11", "w23", "w21", [][]byte{[]byte("w21")}, nil},
+		{0, 3, "w10", "", "b00", [][]byte{[]byte("b00")}, nil},
+		{1, 5, "w21", "b00", "c10", [][]byte{[]byte("c10")}, nil},
+		{2, 5, "b21", "c10", "w22", [][]byte{[]byte("w22")}, nil},
+		{0, 4, "b00", "w22", "w20", [][]byte{[]byte("w20")}, nil},
+		{1, 6, "c10", "w20", "w31", [][]byte{[]byte("w31")}, nil},
+		{2, 6, "w22", "w31", "w32", [][]byte{[]byte("w32")}, nil},
+		{0, 5, "w20", "w32", "w30", [][]byte{[]byte("w30")}, nil},
+		{3, 3, "w23", "w32", "w33", [][]byte{[]byte("w33")}, nil},
+		{1, 7, "w31", "w33", "d13", [][]byte{[]byte("d13")}, nil},
+		{0, 6, "w30", "d13", "w40", [][]byte{[]byte("w40")}, nil},
+		{1, 8, "d13", "w40", "w41", [][]byte{[]byte("w41")}, nil},
+		{2, 7, "w32", "w41", "w42", [][]byte{[]byte("w42")}, nil},
+		{3, 4, "w33", "w42", "w43", [][]byte{[]byte("w43")}, nil},
 	}
 	if full {
 		newPlays := []play{
-			play{2, 8, "w42", "w43", "e23", [][]byte{[]byte("e23")}, nil},
-			play{1, 9, "w41", "e23", "w51", [][]byte{[]byte("w51")}, nil},
+			{2, 8, "w42", "w43", "e23", [][]byte{[]byte("e23")}, nil},
+			{1, 9, "w41", "e23", "w51", [][]byte{[]byte("w51")}, nil},
 		}
 		plays = append(plays, newPlays...)
 	}
 
 	playEvents(plays, nodes, index, orderedEvents)
 
-	hashgraph := createHashgraph(false, orderedEvents, participants, logger.WithField("test", 6))
+	hashgraph := createHashgraph(false, orderedEvents, participants, t)
 
 	return hashgraph, index
 }
 
 func TestFunkyHashgraphFame(t *testing.T) {
-	h, index := initFunkyHashgraph(common.NewTestLogger(t), false)
+	h, index := initFunkyHashgraph(false, t)
 
 	if err := h.DivideRounds(); err != nil {
 		t.Fatal(err)
@@ -2112,23 +2104,23 @@ func TestFunkyHashgraphFame(t *testing.T) {
 
 	//Rounds 1 and 2 should get decided BEFORE round 0
 	expectedpendingRounds := []*PendingRound{
-		&PendingRound{
+		{
 			Index:   0,
 			Decided: false,
 		},
-		&PendingRound{
+		{
 			Index:   1,
 			Decided: true,
 		},
-		&PendingRound{
+		{
 			Index:   2,
 			Decided: true,
 		},
-		&PendingRound{
+		{
 			Index:   3,
 			Decided: false,
 		},
-		&PendingRound{
+		{
 			Index:   4,
 			Decided: false,
 		},
@@ -2159,7 +2151,7 @@ func TestFunkyHashgraphFame(t *testing.T) {
 }
 
 func TestFunkyHashgraphBlocks(t *testing.T) {
-	h, index := initFunkyHashgraph(common.NewTestLogger(t), true)
+	h, index := initFunkyHashgraph(true, t)
 
 	if err := h.DivideRounds(); err != nil {
 		t.Fatal(err)
@@ -2192,11 +2184,11 @@ func TestFunkyHashgraphBlocks(t *testing.T) {
 
 	//rounds 0,1, 2 and 3 should be decided
 	expectedpendingRounds := []*PendingRound{
-		&PendingRound{
+		{
 			Index:   4,
 			Decided: false,
 		},
-		&PendingRound{
+		{
 			Index:   5,
 			Decided: false,
 		},
@@ -2229,7 +2221,7 @@ func TestFunkyHashgraphBlocks(t *testing.T) {
 }
 
 func TestFunkyHashgraphReset(t *testing.T) {
-	h, index := initFunkyHashgraph(common.NewTestLogger(t), true)
+	h, index := initFunkyHashgraph(true, t)
 
 	h.DivideRounds()
 	h.DecideFame()
@@ -2366,48 +2358,48 @@ ATTENTION: Look at roots in Rounds 1 and 2
 	0	 1	  2	   3
 */
 
-func initSparseHashgraph(logger *logrus.Logger) (*Hashgraph, map[string]string) {
+func initSparseHashgraph(t testing.TB) (*Hashgraph, map[string]string) {
 	nodes, index, orderedEvents, participants := initHashgraphNodes(4)
 
-	for i, peer := range participants.Peers {
+	for i := range participants.Peers {
 		name := fmt.Sprintf("w0%d", i)
-		event := NewEvent([][]byte{[]byte(name)}, nil, []string{rootSelfParent(peer.ID()), ""}, nodes[i].Pub, 0)
+		event := NewEvent([][]byte{[]byte(name)}, nil, nil, []string{"", ""}, nodes[i].PubBytes, 0)
 		nodes[i].signAndAddEvent(event, name, index, orderedEvents)
 	}
 
 	plays := []play{
-		play{1, 1, "w01", "w00", "e10", [][]byte{[]byte("e10")}, nil},
-		play{2, 1, "w02", "e10", "e21", [][]byte{[]byte("e21")}, nil},
-		play{3, 1, "w03", "e21", "e32", [][]byte{[]byte("e32")}, nil},
-		play{0, 1, "w00", "e32", "w10", [][]byte{[]byte("w10")}, nil},
-		play{1, 2, "e10", "w10", "w11", [][]byte{[]byte("w11")}, nil},
-		play{0, 2, "w10", "w11", "f01", [][]byte{[]byte("f01")}, nil},
-		play{2, 2, "e21", "f01", "w12", [][]byte{[]byte("w12")}, nil},
-		play{3, 2, "e32", "w12", "w13", [][]byte{[]byte("w13")}, nil},
-		play{1, 3, "w11", "w13", "w21", [][]byte{[]byte("w21")}, nil},
-		play{2, 3, "w12", "w21", "w22", [][]byte{[]byte("w22")}, nil},
-		play{3, 3, "w13", "w22", "w23", [][]byte{[]byte("w23")}, nil},
-		play{1, 4, "w21", "w23", "g13", [][]byte{[]byte("g13")}, nil},
-		play{2, 4, "w22", "g13", "w32", [][]byte{[]byte("w32")}, nil},
-		play{3, 4, "w23", "w32", "w33", [][]byte{[]byte("w33")}, nil},
-		play{1, 5, "g13", "w33", "w31", [][]byte{[]byte("w31")}, nil},
-		play{2, 5, "w32", "w31", "h21", [][]byte{[]byte("h21")}, nil},
-		play{3, 5, "w33", "h21", "w43", [][]byte{[]byte("w43")}, nil},
-		play{1, 6, "w31", "w43", "w41", [][]byte{[]byte("w41")}, nil},
-		play{2, 6, "h21", "w41", "w42", [][]byte{[]byte("w42")}, nil},
-		play{3, 6, "w43", "w42", "i32", [][]byte{[]byte("i32")}, nil},
-		play{1, 7, "w41", "i32", "w51", [][]byte{[]byte("w51")}, nil},
+		{1, 1, "w01", "w00", "e10", [][]byte{[]byte("e10")}, nil},
+		{2, 1, "w02", "e10", "e21", [][]byte{[]byte("e21")}, nil},
+		{3, 1, "w03", "e21", "e32", [][]byte{[]byte("e32")}, nil},
+		{0, 1, "w00", "e32", "w10", [][]byte{[]byte("w10")}, nil},
+		{1, 2, "e10", "w10", "w11", [][]byte{[]byte("w11")}, nil},
+		{0, 2, "w10", "w11", "f01", [][]byte{[]byte("f01")}, nil},
+		{2, 2, "e21", "f01", "w12", [][]byte{[]byte("w12")}, nil},
+		{3, 2, "e32", "w12", "w13", [][]byte{[]byte("w13")}, nil},
+		{1, 3, "w11", "w13", "w21", [][]byte{[]byte("w21")}, nil},
+		{2, 3, "w12", "w21", "w22", [][]byte{[]byte("w22")}, nil},
+		{3, 3, "w13", "w22", "w23", [][]byte{[]byte("w23")}, nil},
+		{1, 4, "w21", "w23", "g13", [][]byte{[]byte("g13")}, nil},
+		{2, 4, "w22", "g13", "w32", [][]byte{[]byte("w32")}, nil},
+		{3, 4, "w23", "w32", "w33", [][]byte{[]byte("w33")}, nil},
+		{1, 5, "g13", "w33", "w31", [][]byte{[]byte("w31")}, nil},
+		{2, 5, "w32", "w31", "h21", [][]byte{[]byte("h21")}, nil},
+		{3, 5, "w33", "h21", "w43", [][]byte{[]byte("w43")}, nil},
+		{1, 6, "w31", "w43", "w41", [][]byte{[]byte("w41")}, nil},
+		{2, 6, "h21", "w41", "w42", [][]byte{[]byte("w42")}, nil},
+		{3, 6, "w43", "w42", "i32", [][]byte{[]byte("i32")}, nil},
+		{1, 7, "w41", "i32", "w51", [][]byte{[]byte("w51")}, nil},
 	}
 
 	playEvents(plays, nodes, index, orderedEvents)
 
-	hashgraph := createHashgraph(false, orderedEvents, participants, logger.WithField("test", 6))
+	hashgraph := createHashgraph(false, orderedEvents, participants, t)
 
 	return hashgraph, index
 }
 
 func TestSparseHashgraphReset(t *testing.T) {
-	h, index := initSparseHashgraph(common.NewTestLogger(t))
+	h, index := initSparseHashgraph(t)
 
 	h.DivideRounds()
 	h.DecideFame()
@@ -2530,7 +2522,7 @@ func getDiff(h *Hashgraph, known map[uint32]int, t *testing.T) []*Event {
 	peerSet, _ := h.Store.GetPeerSet(0)
 	diff := []*Event{}
 	for id, ct := range known {
-		pk := peerSet.ByID[id].PubKeyHex
+		pk := peerSet.ByID[id].PubKeyString()
 		//get participant Events with index > ct
 		participantEvents, err := h.Store.ParticipantEvents(pk, ct)
 		if err != nil {

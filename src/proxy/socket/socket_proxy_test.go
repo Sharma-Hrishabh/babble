@@ -18,7 +18,7 @@ type TestHandler struct {
 	blocks     []hashgraph.Block
 	blockIndex int
 	snapshot   []byte
-	logger     *logrus.Logger
+	logger     *logrus.Entry
 }
 
 func (p *TestHandler) CommitHandler(block hashgraph.Block) (proxy.CommitResponse, error) {
@@ -26,8 +26,14 @@ func (p *TestHandler) CommitHandler(block hashgraph.Block) (proxy.CommitResponse
 
 	p.blocks = append(p.blocks, block)
 
+	receipts := []hashgraph.InternalTransactionReceipt{}
+	for _, it := range block.InternalTransactions() {
+		receipts = append(receipts, it.AsAccepted())
+	}
+
 	response := proxy.CommitResponse{
-		StateHash: []byte("statehash"),
+		StateHash:                   []byte("statehash"),
+		InternalTransactionReceipts: receipts,
 	}
 
 	return response, nil
@@ -50,7 +56,7 @@ func (p *TestHandler) RestoreHandler(snapshot []byte) ([]byte, error) {
 }
 
 func NewTestHandler(t *testing.T) *TestHandler {
-	logger := common.NewTestLogger(t)
+	logger := common.NewTestEntry(t, common.TestLogLevel)
 
 	return &TestHandler{
 		blocks:     []hashgraph.Block{},
@@ -64,7 +70,7 @@ func TestSocketProxyServer(t *testing.T) {
 	clientAddr := "127.0.0.1:6990"
 	proxyAddr := "127.0.0.1:6991"
 
-	appProxy, err := aproxy.NewSocketAppProxy(clientAddr, proxyAddr, 1*time.Second, common.NewTestLogger(t))
+	appProxy, err := aproxy.NewSocketAppProxy(clientAddr, proxyAddr, 1*time.Second, common.NewTestEntry(t, common.TestLogLevel))
 
 	if err != nil {
 		t.Fatalf("Cannot create SocketAppProxy: %s", err)
@@ -90,7 +96,7 @@ func TestSocketProxyServer(t *testing.T) {
 
 	// now client part connecting to RPC service
 	// and calling methods
-	babbleProxy, err := bproxy.NewSocketBabbleProxy(proxyAddr, clientAddr, NewTestHandler(t), 1*time.Second, common.NewTestLogger(t))
+	babbleProxy, err := bproxy.NewSocketBabbleProxy(proxyAddr, clientAddr, NewTestHandler(t), 1*time.Second, common.NewTestEntry(t, common.TestLogLevel))
 
 	if err != nil {
 		t.Fatal(err)
@@ -107,7 +113,7 @@ func TestSocketProxyClient(t *testing.T) {
 	clientAddr := "127.0.0.1:6992"
 	proxyAddr := "127.0.0.1:6993"
 
-	logger := common.NewTestLogger(t)
+	logger := common.NewTestEntry(t, common.TestLogLevel)
 
 	//create app proxy
 	appProxy, err := aproxy.NewSocketAppProxy(clientAddr, proxyAddr, 1*time.Second, logger)
@@ -119,6 +125,9 @@ func TestSocketProxyClient(t *testing.T) {
 
 	//create babble proxy
 	_, err = bproxy.NewSocketBabbleProxy(proxyAddr, clientAddr, handler, 1*time.Second, logger)
+	if err != nil {
+		t.Fatalf("Cannot create SocketBabbleProxy: %s", err)
+	}
 
 	transactions := [][]byte{
 		[]byte("tx 1"),
@@ -126,7 +135,12 @@ func TestSocketProxyClient(t *testing.T) {
 		[]byte("tx 3"),
 	}
 
-	block := hashgraph.NewBlock(0, 1, []byte{}, []*peers.Peer{}, transactions)
+	internalTransactions := []hashgraph.InternalTransaction{
+		hashgraph.NewInternalTransaction(hashgraph.PEER_ADD, *peers.NewPeer("node0", "paris", "")),
+		hashgraph.NewInternalTransaction(hashgraph.PEER_REMOVE, *peers.NewPeer("node1", "london", "")),
+	}
+
+	block := hashgraph.NewBlock(0, 1, []byte{}, []*peers.Peer{}, transactions, internalTransactions)
 
 	expectedStateHash := []byte("statehash")
 	expectedSnapshot := []byte("snapshot")

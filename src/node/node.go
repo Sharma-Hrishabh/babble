@@ -1,12 +1,15 @@
 package node
 
 import (
-	"crypto/ecdsa"
 	"fmt"
+	"os"
+	"os/signal"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/mosaicnetworks/babble/src/config"
 	hg "github.com/mosaicnetworks/babble/src/hashgraph"
 	"github.com/mosaicnetworks/babble/src/net"
 	"github.com/mosaicnetworks/babble/src/peers"
@@ -14,433 +17,239 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// Node defines a babble node
 type Node struct {
-	nodeState
+	// Node operations are implemented as a state-machine. The embedded state
+	// object is used to manage the node's state.
+	state
 
-	conf   *Config
+	conf *config.Config
+
 	logger *logrus.Entry
 
-	id       uint32
+	// core is the link between the node and the underlying hashgraph. It
+	// controls some higher-level operations like inserting a list of events,
+	// keeping track of the peers list, fast-forwarding, etc.
 	core     *Core
 	coreLock sync.Mutex
 
+	// transport is the object used to transmit and receive commands to other
+	// nodes.
 	trans net.Transport
 	netCh <-chan net.RPC
 
-	proxy    proxy.AppProxy
+	// proxy is the link between the node and the application. It is used to
+	// commit blocks from Babble to the application, and relay submitted
+	// transactions from the applications to Babble.
+	proxy proxy.AppProxy
+
+	// submitCh is where the node listens for incoming transactions to be
+	// submitted to Babble
 	submitCh chan []byte
 
+	// sigCh is where the node listens for signals to politely leave the Babble
+	// network. It listens to SIGINT and SIGTERM
+	sigCh chan os.Signal
+
+	// shutdownCh is where the node listens for commands to cleanly shutdown.
 	shutdownCh chan struct{}
 
+	// suspendCh is used to signal the node to enter the Suspended state.
+	suspendCh chan struct{}
+
+	// The node runs the controlTimer in the background to periodically receive
+	// signals to initiate gossip routines. It is paused, reset, etc., based on
+	// the node's current state
 	controlTimer *ControlTimer
 
 	start        time.Time
 	syncRequests int
 	syncErrors   int
 
-	needBoostrap bool
+	// initialUndeterminedEvents keeps a record of how many undetermined events
+	// there were upon initalizing the node. This value is regularly compared
+	// to a current number of undetermined events and the SuspendLimit to
+	// suspend the node.
+	initialUndeterminedEvents int
 }
 
-func NewNode(conf *Config,
-	id uint32,
-	key *ecdsa.PrivateKey,
+// NewNode is a factory method that returns a Node instance
+func NewNode(conf *config.Config,
+	validator *Validator,
 	peers *peers.PeerSet,
+	genesisPeers *peers.PeerSet,
 	store hg.Store,
 	trans net.Transport,
 	proxy proxy.AppProxy,
 ) *Node {
 
+	//Prepare sigCh to relay SIGINT and SIGTERM system calls
+	sigCh := make(chan os.Signal)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+
+	core := NewCore(validator,
+		peers,
+		genesisPeers,
+		store,
+		proxy.CommitBlock,
+		conf.Logger())
+
 	node := Node{
-		id:           id,
 		conf:         conf,
-		logger:       conf.Logger.WithField("this_id", id),
-		core:         NewCore(id, key, peers, store, proxy.CommitBlock, conf.Logger),
+		logger:       conf.Logger(),
+		core:         core,
 		trans:        trans,
 		netCh:        trans.Consumer(),
 		proxy:        proxy,
 		submitCh:     proxy.SubmitCh(),
+		sigCh:        sigCh,
 		shutdownCh:   make(chan struct{}),
+		suspendCh:    make(chan struct{}),
 		controlTimer: NewRandomControlTimer(),
 	}
-
-	node.needBoostrap = store.NeedBoostrap()
 
 	return &node
 }
 
-func (n *Node) Init() error {
-	if n.needBoostrap {
-		n.logger.Debug("Bootstrap")
+/*******************************************************************************
+Public Methods
+*******************************************************************************/
 
+// Init controls the bootstrap process and sets the node's initial state based
+// on configuration (Babbling, CatchingUp, Joining, or Suspended).
+func (n *Node) Init() error {
+
+	// if the bootstrap option is set, load the hashgraph from an existing
+	// database (if bootstrap option is set in config).
+	if n.conf.Bootstrap {
+		n.logger.Debug("Bootstrap")
 		if err := n.core.Bootstrap(); err != nil {
 			return err
 		}
+		n.logger.Debug("Bootstrap completed")
 	}
 
-	if _, ok := n.core.peers.ByID[n.id]; !ok {
-		n.logger.Debug("Node does not belong to PeerSet => Shutdown")
+	// if the maintenance-mode option is not enabled, open the network transport
+	// and decide wether to babble normally, fast-forward, or join. Otherwise
+	// enter the suspended state.
+	if !n.conf.MaintenanceMode {
+		n.logger.Debug("Start Listening")
+		go n.trans.Listen()
+
+		_, ok := n.core.peers.ByID[n.core.validator.ID()]
+		if ok {
+			n.logger.Debug("Node belongs to PeerSet")
+			n.setBabblingOrCatchingUpState()
+		} else {
+			n.logger.Debug("Node does not belong to PeerSet => Joining")
+			n.setState(Joining)
+		}
+	} else {
+		n.setState(Suspended)
 	}
 
-	if err := n.core.SetHeadAndSeq(); err != nil {
-		n.core.SetHeadAndSeq()
-	}
-
-	n.setState(Babbling)
+	// record the number of initial undetermined events so as to suspend the
+	// node when undetermined events exceed this value by SuspendLimit.
+	n.initialUndeterminedEvents = len(n.core.GetUndeterminedEvents())
 
 	return nil
 }
 
-func (n *Node) RunAsync(gossip bool) {
-	n.logger.WithField("gossip", gossip).Debug("runasync")
-
-	go n.Run(gossip)
-}
-
+// Run invokes the main loop of the node. The gossip parameter controls whether
+// to actively participate in gossip or not.
 func (n *Node) Run(gossip bool) {
-	//The ControlTimer allows the background routines to control the
-	//heartbeat timer when the node is in the Babbling state. The timer should
-	//only be running when there are uncommitted transactions in the system.
+	// The ControlTimer allows the background routines to control the heartbeat
+	// timer when the node is in the Babbling state. The timer should only be
+	// running when there are uncommitted transactions in the system.
 	go n.controlTimer.Run(n.conf.HeartbeatTimeout)
 
-	//Execute some background work regardless of the state of the node.
+	// Execute some background work regardless of the state of the node.
 	go n.doBackgroundWork()
 
-	//Execute Node State Machine
+	// Execute Node State Machine
 	for {
-		//Run different routines depending on node state
+		// Run different routines depending on node state
 		state := n.getState()
-
-		n.logger.WithField("state", state.String()).Debug("Run loop")
 
 		switch state {
 		case Babbling:
 			n.babble(gossip)
 		case CatchingUp:
 			n.fastForward()
+		case Joining:
+			n.join()
+		case Suspended:
+			time.Sleep(2000 * time.Millisecond)
 		case Shutdown:
 			return
 		}
 	}
 }
 
-func (n *Node) resetTimer() {
-	n.coreLock.Lock()
-	defer n.coreLock.Unlock()
-
-	if !n.controlTimer.set {
-		ts := n.conf.HeartbeatTimeout
-
-		//Slow gossip if nothing interesting to say
-		if n.core.hg.PendingLoadedEvents == 0 &&
-			len(n.core.transactionPool) == 0 &&
-			n.core.selfBlockSignatures.Len() == 0 {
-			ts = time.Duration(time.Second)
-		}
-
-		n.controlTimer.resetCh <- ts
-	}
+// RunAsync runs the node in a separate goroutine
+func (n *Node) RunAsync(gossip bool) {
+	n.logger.WithField("gossip", gossip).Debug("runasync")
+	go n.Run(gossip)
 }
 
-func (n *Node) doBackgroundWork() {
-	for {
-		select {
-		case t := <-n.submitCh:
-			n.logger.Debug("Adding Transaction")
-			n.addTransaction(t)
-			n.resetTimer()
-		case <-n.shutdownCh:
-			return
-		}
-	}
-}
+// Leave causes the node to politely leave the network via a LeaveRequest and
+// wait for the node to be removed from the validator-list via consensus.
+func (n *Node) Leave() error {
+	n.logger.Info("LEAVING")
 
-//babble is interrupted when a gossip function, launched asychronously, changes
-//the state from Babbling to CatchingUp, or when the node is shutdown.
-//Otherwise, it processes RPC requests, periodicaly initiates gossip while there
-//is something to gossip about, or waits.
-func (n *Node) babble(gossip bool) {
-	n.logger.Debug("BABBLING")
+	defer n.Shutdown()
 
-	returnCh := make(chan struct{}, 100)
-	for {
-		select {
-		case rpc := <-n.netCh:
-			n.goFunc(func() {
-				n.logger.Debug("Processing RPC")
-				n.processRPC(rpc)
-				n.resetTimer()
-			})
-		case <-n.controlTimer.tickCh:
-			if gossip {
-				n.logger.Debug("Time to gossip!")
-				peer := n.core.peerSelector.Next()
-				if peer != nil {
-					n.goFunc(func() { n.gossip(peer, returnCh) })
-				} else {
-					n.monologue()
-				}
-			}
-			n.resetTimer()
-		case <-returnCh:
-			return
-		case <-n.shutdownCh:
-			return
-		}
-	}
-}
-
-func (n *Node) fastForward() error {
-	n.logger.Debug("CATCHING-UP")
-
-	//wait until sync routines finish
-	n.waitRoutines()
-
-	//fastForwardRequest
-	peer := n.core.peerSelector.Next()
-
-	start := time.Now()
-	resp, err := n.requestFastForward(peer.NetAddr)
-	elapsed := time.Since(start)
-	n.logger.WithField("duration", elapsed.Nanoseconds()).Debug("requestFastForward()")
+	err := n.core.Leave(n.conf.JoinTimeout)
 	if err != nil {
-		n.logger.WithField("error", err).Error("requestFastForward()")
-		return err
-	}
-
-	n.logger.WithFields(logrus.Fields{
-		"from_id":              resp.FromID,
-		"block_index":          resp.Block.Index(),
-		"block_round_received": resp.Block.RoundReceived(),
-		"frame_events":         len(resp.Frame.Events),
-		"frame_roots":          resp.Frame.Roots,
-		"frame_peers":          len(resp.Frame.Peers),
-		"snapshot":             resp.Snapshot,
-	}).Debug("FastForwardResponse")
-
-	//prepare core. ie: fresh hashgraph
-	n.coreLock.Lock()
-	err = n.core.FastForward(peer.PubKeyHex, &resp.Block, &resp.Frame)
-	n.coreLock.Unlock()
-	if err != nil {
-		n.logger.WithError(err).Error("Fast Forwarding Hashgraph")
-		return err
-	}
-
-	//update app from snapshot
-	err = n.proxy.Restore(resp.Snapshot)
-	if err != nil {
-		n.logger.WithError(err).Error("Restoring App from Snapshot")
-		return err
-	}
-
-	n.logger.Debug("Fast-Forward OK")
-
-	n.setState(Babbling)
-
-	return nil
-}
-
-//This function is usually called in a go-routine and needs to inform the
-//calling routine (usually the babble routine) when it is time to exit the
-//Babbling state and return.
-func (n *Node) gossip(peer *peers.Peer, parentReturnCh chan struct{}) error {
-	//pull
-	syncLimit, otherKnownEvents, err := n.pull(peer)
-	if err != nil {
-		n.logger.WithError(err).Error("gossip pull")
-		return err
-	}
-
-	//check and handle syncLimit
-	if syncLimit {
-		n.logger.WithField("from", peer.ID()).Debug("SyncLimit")
-		n.setState(CatchingUp) //
-		parentReturnCh <- struct{}{}
-
-		return nil
-	}
-
-	//push
-	err = n.push(peer, otherKnownEvents)
-	if err != nil {
-		n.logger.WithError(err).Error("gossip push")
-		return err
-	}
-
-	//update peer selector
-	n.core.selectorLock.Lock()
-	n.core.peerSelector.UpdateLast(peer.ID())
-	n.core.selectorLock.Unlock()
-
-	n.logStats()
-
-	return nil
-}
-
-func (n *Node) monologue() error {
-	n.coreLock.Lock()
-	defer n.coreLock.Unlock()
-
-	err := n.core.AddSelfEvent("")
-	if err != nil {
-		n.logger.WithError(err).Error("monologue, AddSelfEvent()")
-		return err
-	}
-
-	err = n.core.ProcessSigPool()
-	if err != nil {
-		n.logger.WithError(err).Error("monologue, ProcessSigPool()")
+		n.logger.WithError(err).Error("Leaving")
 		return err
 	}
 
 	return nil
 }
 
-func (n *Node) pull(peer *peers.Peer) (syncLimit bool, otherKnownEvents map[uint32]int, err error) {
-	//Compute Known
-	n.coreLock.Lock()
-	knownEvents := n.core.KnownEvents()
-	n.coreLock.Unlock()
-
-	//Send SyncRequest
-	start := time.Now()
-	resp, err := n.requestSync(peer.NetAddr, knownEvents)
-	elapsed := time.Since(start)
-	n.logger.WithField("duration", elapsed.Nanoseconds()).Debug("requestSync()")
-
-	if err != nil {
-		n.logger.WithField("error", err).Error("requestSync()")
-		return false, nil, err
-	}
-
-	n.logger.WithFields(logrus.Fields{
-		"from_id":    resp.FromID,
-		"sync_limit": resp.SyncLimit,
-		"events":     len(resp.Events),
-		"known":      resp.Known,
-	}).Debug("SyncResponse")
-
-	if resp.SyncLimit {
-		return true, nil, nil
-	}
-
-	//Add Events to Hashgraph and create new Head if necessary
-	n.coreLock.Lock()
-	err = n.sync(peer.ID(), resp.Events)
-	n.coreLock.Unlock()
-
-	if err != nil {
-		n.logger.WithField("error", err).Error("sync()")
-		return false, nil, err
-	}
-
-	return false, resp.Known, nil
-}
-
-func (n *Node) push(peer *peers.Peer, knownEvents map[uint32]int) error {
-	//Check SyncLimit
-	n.coreLock.Lock()
-	overSyncLimit := n.core.OverSyncLimit(knownEvents, n.conf.SyncLimit)
-	n.coreLock.Unlock()
-
-	if overSyncLimit {
-		n.logger.Debug("SyncLimit")
-		return nil
-	}
-
-	//Compute Diff
-	start := time.Now()
-	n.coreLock.Lock()
-	eventDiff, err := n.core.EventDiff(knownEvents)
-	n.coreLock.Unlock()
-	elapsed := time.Since(start)
-	n.logger.WithField("duration", elapsed.Nanoseconds()).Debug("Diff()")
-	if err != nil {
-		n.logger.WithField("error", err).Error("Calculating Diff")
-		return err
-	}
-
-	if len(eventDiff) > 0 {
-		//Convert to WireEvents
-		wireEvents, err := n.core.ToWire(eventDiff)
-		if err != nil {
-			n.logger.WithField("error", err).Debug("Converting to WireEvent")
-			return err
-		}
-
-		//Create and Send EagerSyncRequest
-		start = time.Now()
-		resp2, err := n.requestEagerSync(peer.NetAddr, wireEvents)
-		elapsed = time.Since(start)
-		n.logger.WithField("duration", elapsed.Nanoseconds()).Debug("requestEagerSync()")
-		if err != nil {
-			n.logger.WithField("error", err).Error("requestEagerSync()")
-			return err
-		}
-		n.logger.WithFields(logrus.Fields{
-			"from_id": resp2.FromID,
-			"success": resp2.Success,
-		}).Debug("EagerSyncResponse")
-	}
-
-	return nil
-}
-
-func (n *Node) sync(fromID uint32, events []hg.WireEvent) error {
-	//Insert Events in Hashgraph and create new Head if necessary
-	start := time.Now()
-	err := n.core.Sync(fromID, events)
-	elapsed := time.Since(start)
-	n.logger.WithField("duration", elapsed.Nanoseconds()).Debug("Sync()")
-	if err != nil {
-		n.logger.WithError(err).Error()
-		return err
-	}
-
-	//Process SignaturePool
-	start = time.Now()
-	err = n.core.ProcessSigPool()
-	elapsed = time.Since(start)
-	n.logger.WithField("duration", elapsed.Nanoseconds()).Debug("ProcessSigPool()")
-	if err != nil {
-		n.logger.WithError(err).Error()
-		return err
-	}
-
-	return nil
-}
-
-func (n *Node) addTransaction(tx []byte) {
-	n.coreLock.Lock()
-	defer n.coreLock.Unlock()
-
-	n.core.AddTransactions([][]byte{tx})
-}
-
+// Shutdown attempts to cleanly shutdown the node by waiting for pending work to
+// be finished, stopping the control-timer, and closing the transport.
 func (n *Node) Shutdown() {
 	if n.getState() != Shutdown {
-		n.logger.Debug("Shutdown")
+		n.logger.Info("SHUTDOWN")
 
-		//Exit any non-shutdown state immediately
+		// exit any non-shutdown state immediately
 		n.setState(Shutdown)
 
-		//Stop and wait for concurrent operations
+		// stop and wait for concurrent operations
 		close(n.shutdownCh)
-
 		n.waitRoutines()
 
-		//For some reason this needs to be called after closing the shutdownCh
-		//Not entirely sure why...
-		n.controlTimer.Shutdown()
-
-		//transport and store should only be closed once all concurrent operations
-		//are finished otherwise they will panic trying to use close objects
+		// close transport and store
 		n.trans.Close()
 
 		n.core.hg.Store.Close()
 	}
 }
 
+// Suspend puts the node in Suspended mode. It doesn't close the transport
+// because it needs to respond to incoming SyncRequests.
+func (n *Node) Suspend() {
+	if n.getState() != Suspended &&
+		n.getState() != Shutdown {
+
+		n.logger.Info("SUSPEND")
+
+		n.setState(Suspended)
+
+		// Stop and wait for concurrent operations
+		close(n.suspendCh)
+		n.waitRoutines()
+	}
+}
+
+// GetID returns the numeric ID of the node's validator
+func (n *Node) GetID() uint32 {
+	return n.core.validator.ID()
+}
+
+// GetStats returns information about the node.
 func (n *Node) GetStats() map[string]string {
 	toString := func(i *int) string {
 		if i == nil {
@@ -472,16 +281,492 @@ func (n *Node) GetStats() map[string]string {
 		"undetermined_events":    strconv.Itoa(len(n.core.GetUndeterminedEvents())),
 		"transaction_pool":       strconv.Itoa(len(n.core.transactionPool)),
 		"num_peers":              strconv.Itoa(n.core.peerSelector.Peers().Len()),
-		"sync_rate":              strconv.FormatFloat(n.SyncRate(), 'f', 2, 64),
+		"last_peer_change":       strconv.Itoa(n.core.LastPeerChangeRound),
+		"sync_rate":              strconv.FormatFloat(n.syncRate(), 'f', 2, 64),
 		"events_per_second":      strconv.FormatFloat(consensusEventsPerSecond, 'f', 2, 64),
 		"rounds_per_second":      strconv.FormatFloat(consensusRoundsPerSecond, 'f', 2, 64),
 		"round_events":           strconv.Itoa(n.core.GetLastCommitedRoundEventsCount()),
-		"id":                     fmt.Sprint(n.id),
+		"id":                     fmt.Sprint(n.core.validator.ID()),
 		"state":                  n.getState().String(),
+		"moniker":                n.core.validator.Moniker,
+		"time":                   strconv.FormatInt(time.Now().UnixNano(), 10),
 	}
 	return s
 }
 
+// GetBlock returns a block
+func (n *Node) GetBlock(blockIndex int) (*hg.Block, error) {
+	return n.core.hg.Store.GetBlock(blockIndex)
+}
+
+// GetLastBlockIndex returns the index of the last known block
+func (n *Node) GetLastBlockIndex() int {
+	return n.core.GetLastBlockIndex()
+}
+
+// GetLastConsensusRoundIndex returns the index of the last consensus round
+func (n *Node) GetLastConsensusRoundIndex() int {
+	lcr := n.core.GetLastConsensusRoundIndex()
+	if lcr == nil {
+		return -1
+	}
+	return *lcr
+}
+
+// GetPeers returns the current peers. Not necessarily equal to the
+// current validator-set
+func (n *Node) GetPeers() []*peers.Peer {
+	return n.core.peers.Peers
+}
+
+// GetValidatorSet returns the validator-set associated to a round
+func (n *Node) GetValidatorSet(round int) ([]*peers.Peer, error) {
+	peerSet, err := n.core.hg.Store.GetPeerSet(round)
+	if err != nil {
+		return nil, err
+	}
+	return peerSet.Peers, nil
+}
+
+// GetAllValidatorSets returns the entire history of validator-sets
+func (n *Node) GetAllValidatorSets() (map[int][]*peers.Peer, error) {
+	return n.core.hg.Store.GetAllPeerSets()
+}
+
+/*******************************************************************************
+Background
+*******************************************************************************/
+
+// doBackgroundWork coninuously listens to incoming transactions, and the sigint
+// signal, regardless of the node's state. It also listens to incoming gossip.
+func (n *Node) doBackgroundWork() {
+	for {
+		select {
+		case rpc := <-n.netCh:
+			n.goFunc(func() {
+				n.processRPC(rpc)
+				n.resetTimer()
+			})
+		case t := <-n.submitCh:
+			n.logger.Debug("Adding Transaction")
+			n.addTransaction(t)
+			n.resetTimer()
+		case <-n.shutdownCh:
+			return
+		case s := <-n.sigCh:
+			n.logger.Debugf("Process %s - LEAVE", s.String())
+			n.Leave()
+			os.Exit(0)
+		}
+	}
+}
+
+// resetTimer resets the control timer to the configured hearbeat timeout, or
+// slows it down if the node is not busy.
+func (n *Node) resetTimer() {
+	n.coreLock.Lock()
+	defer n.coreLock.Unlock()
+
+	if !n.controlTimer.set {
+		ts := n.conf.HeartbeatTimeout
+
+		//Slow gossip if nothing interesting to say
+		if !n.core.Busy() {
+			ts = time.Duration(time.Second)
+		}
+
+		n.controlTimer.resetCh <- ts
+	}
+}
+
+// checkSuspend suspends the node if the number of undetermined events in the
+// hashgraph exceeds initialUndeterminedEvents by SuspendLimit, or the validator
+// has been evicted.
+func (n *Node) checkSuspend() {
+
+	// check too many undetermined events
+	newUndeterminedEvents := len(n.core.GetUndeterminedEvents()) - n.initialUndeterminedEvents
+	tooManyUndeterminedEvents := newUndeterminedEvents > n.conf.SuspendLimit
+
+	// check evicted
+	evicted := n.core.hg.LastConsensusRound != nil &&
+		n.core.RemovedRound > 0 &&
+		*n.core.hg.LastConsensusRound >= n.core.RemovedRound
+
+	// suspend if too many undetermined events or evicted
+	if tooManyUndeterminedEvents || evicted {
+		n.Suspend()
+	}
+}
+
+/*******************************************************************************
+Babbling
+*******************************************************************************/
+
+// babble periodically initiates gossip or monologue as triggered by the
+// controlTimer.
+func (n *Node) babble(gossip bool) {
+	n.logger.Info("BABBLING")
+
+	for {
+		select {
+		case <-n.controlTimer.tickCh:
+			if gossip {
+				peer := n.core.peerSelector.Next()
+				if peer != nil {
+					n.goFunc(func() {
+						n.gossip(peer)
+					})
+				} else {
+					n.monologue()
+				}
+			}
+			n.resetTimer()
+			n.checkSuspend()
+		case <-n.suspendCh:
+			return
+		case <-n.shutdownCh:
+			return
+		}
+	}
+}
+
+// monologue is called when the node is alone in the network but wants to record
+// some events anyway.
+func (n *Node) monologue() error {
+	n.coreLock.Lock()
+	defer n.coreLock.Unlock()
+
+	if n.core.Busy() {
+		err := n.core.AddSelfEvent("")
+		if err != nil {
+			n.logger.WithError(err).Error("monologue, AddSelfEvent()")
+			return err
+		}
+
+		err = n.core.ProcessSigPool()
+		if err != nil {
+			n.logger.WithError(err).Error("monologue, ProcessSigPool()")
+			return err
+		}
+	}
+
+	return nil
+}
+
+// gossip performs a pull-push gossip operation with the selected peer.
+func (n *Node) gossip(peer *peers.Peer) error {
+	var connected bool
+
+	defer func() {
+		// update peer selector
+		n.core.selectorLock.Lock()
+		newConnection := n.core.peerSelector.UpdateLast(peer.ID(), connected)
+		n.core.selectorLock.Unlock()
+		if newConnection {
+			n.logger.WithFields(logrus.Fields{
+				"peer_ID":      peer.ID(),
+				"peer_moniker": peer.Moniker,
+			}).Info("Connected")
+		}
+	}()
+
+	// pull
+	otherKnownEvents, err := n.pull(peer)
+	if err != nil {
+		n.logger.WithError(err).Warn("gossip pull")
+		return err
+	}
+
+	// push
+	err = n.push(peer, otherKnownEvents)
+	if err != nil {
+		n.logger.WithError(err).Warn("gossip push")
+		return err
+	}
+
+	n.logStats()
+
+	connected = true
+
+	return nil
+}
+
+// pull performs a SyncRequest and processes the response.
+func (n *Node) pull(peer *peers.Peer) (otherKnownEvents map[uint32]int, err error) {
+	//Compute Known
+	n.coreLock.Lock()
+	knownEvents := n.core.KnownEvents()
+	n.coreLock.Unlock()
+
+	//Send SyncRequest
+	start := time.Now()
+	resp, err := n.requestSync(peer.NetAddr, knownEvents, n.conf.SyncLimit)
+	elapsed := time.Since(start)
+	n.logger.WithField("duration", elapsed.Nanoseconds()).Debug("requestSync()")
+
+	if err != nil {
+		n.logger.WithField("error", err).Warn("requestSync()")
+		return nil, err
+	}
+
+	n.logger.WithFields(logrus.Fields{
+		"from_id": resp.FromID,
+		"events":  len(resp.Events),
+		"known":   resp.Known,
+	}).Debug("SyncResponse")
+
+	//Add Events to Hashgraph and create new Head if necessary
+	n.coreLock.Lock()
+	err = n.sync(peer.ID(), resp.Events)
+	n.coreLock.Unlock()
+
+	if err != nil {
+		n.logger.WithField("error", err).Error("sync()")
+		return nil, err
+	}
+
+	return resp.Known, nil
+}
+
+// push preforms an EagerSyncRequest
+func (n *Node) push(peer *peers.Peer, knownEvents map[uint32]int) error {
+	// Compute Diff
+	start := time.Now()
+	n.coreLock.Lock()
+	eventDiff, err := n.core.EventDiff(knownEvents)
+	n.coreLock.Unlock()
+	elapsed := time.Since(start)
+	n.logger.WithField("duration", elapsed.Nanoseconds()).Debug("Diff()")
+	if err != nil {
+		n.logger.WithField("error", err).Error("Calculating Diff")
+		return err
+	}
+
+	if len(eventDiff) > 0 {
+		// do not push more than sync_limit events
+		if n.conf.SyncLimit < len(eventDiff) {
+			n.logger.WithFields(logrus.Fields{
+				"sync_limit":  n.conf.SyncLimit,
+				"diff_length": len(eventDiff),
+			}).Debug("Push sync_limit")
+			eventDiff = eventDiff[:n.conf.SyncLimit]
+		}
+
+		// Convert to WireEvents
+		wireEvents, err := n.core.ToWire(eventDiff)
+		if err != nil {
+			n.logger.WithField("error", err).Debug("Converting to WireEvent")
+			return err
+		}
+
+		// Create and Send EagerSyncRequest
+		start = time.Now()
+		resp2, err := n.requestEagerSync(peer.NetAddr, wireEvents)
+		elapsed = time.Since(start)
+		n.logger.WithField("duration", elapsed.Nanoseconds()).Debug("requestEagerSync()")
+		if err != nil {
+			n.logger.WithField("error", err).Warn("requestEagerSync()")
+			return err
+		}
+		n.logger.WithFields(logrus.Fields{
+			"from_id": resp2.FromID,
+			"success": resp2.Success,
+		}).Debug("EagerSyncResponse")
+	}
+
+	return nil
+}
+
+// sync attempts to insert a list of events into the hashgraph, record a new
+// sync event, and process the signature pool.
+func (n *Node) sync(fromID uint32, events []hg.WireEvent) error {
+	//Insert Events in Hashgraph and create new Head if necessary
+	start := time.Now()
+	err := n.core.Sync(fromID, events)
+	elapsed := time.Since(start)
+	n.logger.WithField("duration", elapsed.Nanoseconds()).Debug("Sync()")
+	if err != nil {
+		if !hg.IsNormalSelfParentError(err) {
+			n.logger.WithError(err).Error()
+			return err
+		}
+	}
+
+	//Process SignaturePool
+	start = time.Now()
+	err = n.core.ProcessSigPool()
+	elapsed = time.Since(start)
+	n.logger.WithField("duration", elapsed.Nanoseconds()).Debug("ProcessSigPool()")
+	if err != nil {
+		n.logger.WithError(err).Error()
+		return err
+	}
+
+	return nil
+}
+
+/*******************************************************************************
+CatchingUp
+*******************************************************************************/
+
+// fastForward enacts "CatchingUp"
+func (n *Node) fastForward() error {
+	n.logger.Info("CATCHING-UP")
+
+	//wait until sync routines finish
+	n.waitRoutines()
+
+	var err error
+
+	// loop through all peers to check who is the most ahead, then fast-forward
+	// from them. If no-one is ready to fast-forward, transition to the Babbling
+	// state.
+	resp := n.getBestFastForwardResponse()
+	if resp == nil {
+		n.logger.Error("getBestFastForwardResponse returned nil => Babbling")
+		n.setState(Babbling)
+		return fmt.Errorf("getBestFastForwardResponse returned nil")
+	}
+
+	//update app from snapshot
+	err = n.proxy.Restore(resp.Snapshot)
+	if err != nil {
+		n.logger.WithError(err).Error("Restoring App from Snapshot")
+		return err
+	}
+
+	//prepare core. ie: fresh hashgraph
+	n.coreLock.Lock()
+	err = n.core.FastForward(&resp.Block, &resp.Frame)
+	n.coreLock.Unlock()
+	if err != nil {
+		n.logger.WithError(err).Error("Fast Forwarding Hashgraph")
+		return err
+	}
+
+	err = n.core.ProcessAcceptedInternalTransactions(resp.Block.RoundReceived(), resp.Block.InternalTransactionReceipts())
+	if err != nil {
+		n.logger.WithError(err).Error("Processing AnchorBlock InternalTransactionReceipts")
+	}
+
+	n.logger.Debug("FastForward OK")
+
+	n.setState(Babbling)
+
+	return nil
+}
+
+// getBestFastForwardResponse performs a FastForwardRequest with all known peers
+// and only selects the one corresponding to the hightest block number.
+func (n *Node) getBestFastForwardResponse() *net.FastForwardResponse {
+	var bestResponse *net.FastForwardResponse
+	maxBlock := 0
+
+	for _, p := range n.core.peerSelector.Peers().Peers {
+		start := time.Now()
+		resp, err := n.requestFastForward(p.NetAddr)
+		elapsed := time.Since(start)
+		n.logger.WithField("duration", elapsed.Nanoseconds()).Debug("requestFastForward()")
+		if err != nil {
+			n.logger.WithField("error", err).Error("requestFastForward()")
+			continue
+		}
+
+		n.logger.WithFields(logrus.Fields{
+			"from_id":              resp.FromID,
+			"block_index":          resp.Block.Index(),
+			"block_round_received": resp.Block.RoundReceived(),
+			"frame_events":         len(resp.Frame.Events),
+			"frame_roots":          resp.Frame.Roots,
+			"frame_peers":          len(resp.Frame.Peers),
+			"snapshot":             resp.Snapshot,
+		}).Debug("FastForwardResponse")
+
+		if resp.Block.Index() > maxBlock {
+			bestResponse = &resp
+			maxBlock = resp.Block.Index()
+		}
+	}
+
+	return bestResponse
+}
+
+/*******************************************************************************
+Joining
+*******************************************************************************/
+
+// join attempts to add the node's validator public-key to the current
+// validator-set via an InternalTransaction which has to go through consensus.
+func (n *Node) join() error {
+	n.logger.Info("JOINING")
+
+	peer := n.core.peerSelector.Next()
+
+	start := time.Now()
+	resp, err := n.requestJoin(peer.NetAddr)
+	elapsed := time.Since(start)
+	n.logger.WithField("duration", elapsed.Nanoseconds()).Debug("requestJoin()")
+
+	if err != nil {
+		n.logger.Error("Cannot join:", peer.NetAddr, err)
+		return err
+	}
+
+	n.logger.WithFields(logrus.Fields{
+		"from_id":        resp.FromID,
+		"accepted":       resp.Accepted,
+		"accepted_round": resp.AcceptedRound,
+		"peers":          len(resp.Peers),
+	}).Debug("JoinResponse")
+
+	if resp.Accepted {
+		// Set AcceptedRound, which is the next round at which the node is
+		// allowed to create SelfEventss, and reset RemovedRound to
+		// "unsuspend" a node if had been evicted prior to rejoining.
+		n.core.AcceptedRound = resp.AcceptedRound
+		n.core.RemovedRound = -1
+
+		n.setBabblingOrCatchingUpState()
+	} else {
+		// Then JoinRequest was explicitly refused by the curren peer-set. This
+		// is not an error.
+		n.logger.Info("JoinRequest rejected")
+		n.Shutdown()
+	}
+
+	return nil
+}
+
+/*******************************************************************************
+Utils
+*******************************************************************************/
+
+// setBabblingOrCatchingUpState sets the node's state to CatchingUp if fast-sync
+// is enabled, or to Babbling if fast-sync is not enabled.
+func (n *Node) setBabblingOrCatchingUpState() {
+	if n.conf.EnableFastSync {
+		n.logger.Debug("FastSync enabled => CatchingUp")
+		n.setState(CatchingUp)
+	} else {
+		n.logger.Debug("FastSync not enabled => Babbling")
+		if err := n.core.SetHeadAndSeq(); err != nil {
+			n.core.SetHeadAndSeq()
+		}
+		n.setState(Babbling)
+	}
+}
+
+// addTransaction is a thread-safe function to add and incoming transaction to
+// the core's transaction-pool.
+func (n *Node) addTransaction(tx []byte) {
+	n.coreLock.Lock()
+	defer n.coreLock.Unlock()
+
+	n.core.AddTransactions([][]byte{tx})
+}
+
+// logStats logs the output returned by GetStats()
 func (n *Node) logStats() {
 	stats := n.GetStats()
 
@@ -499,10 +784,12 @@ func (n *Node) logStats() {
 		"round_events":           stats["round_events"],
 		"id":                     stats["id"],
 		"state":                  stats["state"],
+		"moniker":                stats["moniker"],
 	}).Debug("Stats")
 }
 
-func (n *Node) SyncRate() float64 {
+// syncRate computes the ratio of sync-errors over sync-requests
+func (n *Node) syncRate() float64 {
 	var syncErrorRate float64
 
 	if n.syncRequests != 0 {
@@ -510,22 +797,4 @@ func (n *Node) SyncRate() float64 {
 	}
 
 	return 1 - syncErrorRate
-}
-
-func (n *Node) GetBlock(blockIndex int) (*hg.Block, error) {
-	return n.core.hg.Store.GetBlock(blockIndex)
-}
-
-func (n *Node) GetEvents() (map[uint32]int, error) {
-	res := n.core.KnownEvents()
-
-	return res, nil
-}
-
-func (n *Node) ID() uint32 {
-	return n.id
-}
-
-func (n *Node) GetPeers() []*peers.Peer {
-	return n.core.peers.Peers
 }

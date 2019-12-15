@@ -7,6 +7,7 @@ import (
 
 type timerFactory func(time.Duration) <-chan time.Time
 
+//ControlTimer struct
 type ControlTimer struct {
 	timerFactory timerFactory
 	tickCh       chan struct{}      //sends a signal to listening process
@@ -14,8 +15,10 @@ type ControlTimer struct {
 	stopCh       chan struct{}      //receives instruction to stop the heartbeatTimer
 	shutdownCh   chan struct{}      //receives instruction to exit Run loop
 	set          bool
+	shutdown     bool
 }
 
+//NewControlTimer is a ControlTimer factory method
 func NewControlTimer(timerFactory timerFactory) *ControlTimer {
 	return &ControlTimer{
 		timerFactory: timerFactory,
@@ -26,6 +29,8 @@ func NewControlTimer(timerFactory timerFactory) *ControlTimer {
 	}
 }
 
+//NewRandomControlTimer is a ControlTimer factory method that produces a
+//ControlTimer with a random timeout
 func NewRandomControlTimer() *ControlTimer {
 
 	randomTimeout := func(min time.Duration) <-chan time.Time {
@@ -38,6 +43,7 @@ func NewRandomControlTimer() *ControlTimer {
 	return NewControlTimer(randomTimeout)
 }
 
+//Run starts the Control Timer
 func (c *ControlTimer) Run(init time.Duration) {
 
 	setTimer := func(t time.Duration) <-chan time.Time {
@@ -63,6 +69,11 @@ func (c *ControlTimer) Run(init time.Duration) {
 	}
 }
 
+//Shutdown shuts down the ControlTimer
 func (c *ControlTimer) Shutdown() {
-	close(c.shutdownCh)
+	if !c.shutdown {
+		close(c.shutdownCh)
+		c.shutdown = true
+	}
+	return
 }

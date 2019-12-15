@@ -8,6 +8,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// SocketBabbleProxy ...
 type SocketBabbleProxy struct {
 	nodeAddress string
 	bindAddress string
@@ -18,18 +19,19 @@ type SocketBabbleProxy struct {
 	server *SocketBabbleProxyServer
 }
 
+// NewSocketBabbleProxy ...
 func NewSocketBabbleProxy(
 	nodeAddr string,
 	bindAddr string,
 	handler proxy.ProxyHandler,
 	timeout time.Duration,
-	logger *logrus.Logger,
+	logger *logrus.Entry,
 ) (*SocketBabbleProxy, error) {
 
 	if logger == nil {
-		logger = logrus.New()
-
-		logger.Level = logrus.DebugLevel
+		log := logrus.New()
+		log.Level = logrus.DebugLevel
+		logger = logrus.NewEntry(log)
 	}
 
 	client := NewSocketBabbleProxyClient(nodeAddr, timeout)
@@ -53,6 +55,7 @@ func NewSocketBabbleProxy(
 	return proxy, nil
 }
 
+// SubmitTx ...
 func (p *SocketBabbleProxy) SubmitTx(tx []byte) error {
 	ack, err := p.client.SubmitTx(tx)
 

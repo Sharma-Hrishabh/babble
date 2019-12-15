@@ -64,6 +64,11 @@ func (i *InmemTransport) LocalAddr() string {
 	return i.localAddr
 }
 
+// AdvertiseAddr implements the Transport interface.
+func (i *InmemTransport) AdvertiseAddr() string {
+	return i.localAddr
+}
+
 // Sync implements the Transport interface.
 func (i *InmemTransport) Sync(target string, args *SyncRequest, resp *SyncResponse) error {
 	rpcResp, err := i.makeRPC(target, args, nil, i.timeout)
@@ -99,6 +104,19 @@ func (i *InmemTransport) FastForward(target string, args *FastForwardRequest, re
 
 	// Copy the result back
 	out := rpcResp.Response.(*FastForwardResponse)
+	*resp = *out
+	return nil
+}
+
+// Join implements the Transport interface
+func (i *InmemTransport) Join(target string, args *JoinRequest, resp *JoinResponse) error {
+	rpcResp, err := i.makeRPC(target, args, nil, i.timeout)
+	if err != nil {
+		return err
+	}
+
+	// Copy the result back
+	out := rpcResp.Response.(*JoinResponse)
 	*resp = *out
 	return nil
 }
@@ -160,4 +178,9 @@ func (i *InmemTransport) DisconnectAll() {
 func (i *InmemTransport) Close() error {
 	i.DisconnectAll()
 	return nil
+}
+
+// Listen is an empty function as there is no need to defer
+// initialisation of the InMem service
+func (i *InmemTransport) Listen() {
 }

@@ -3,34 +3,23 @@ package hashgraph
 import (
 	"bytes"
 
+	"github.com/mosaicnetworks/babble/src/common"
 	"github.com/mosaicnetworks/babble/src/peers"
 	"github.com/ugorji/go/codec"
 )
-
-type Trilean int
-
-const (
-	Undefined Trilean = iota
-	True
-	False
-)
-
-var trileans = []string{"Undefined", "True", "False"}
-
-func (t Trilean) String() string {
-	return trileans[t]
-}
 
 type pendingRound struct {
 	Index   int
 	Decided bool
 }
 
+// RoundEvent ...
 type RoundEvent struct {
 	Witness bool
-	Famous  Trilean
+	Famous  common.Trilean
 }
 
+// RoundInfo ...
 type RoundInfo struct {
 	CreatedEvents  map[string]RoundEvent
 	ReceivedEvents []string
@@ -38,6 +27,7 @@ type RoundInfo struct {
 	decided        bool
 }
 
+// NewRoundInfo ...
 func NewRoundInfo() *RoundInfo {
 	return &RoundInfo{
 		CreatedEvents:  make(map[string]RoundEvent),
@@ -45,6 +35,7 @@ func NewRoundInfo() *RoundInfo {
 	}
 }
 
+// AddCreatedEvent ...
 func (r *RoundInfo) AddCreatedEvent(x string, witness bool) {
 	_, ok := r.CreatedEvents[x]
 	if !ok {
@@ -54,10 +45,12 @@ func (r *RoundInfo) AddCreatedEvent(x string, witness bool) {
 	}
 }
 
+// AddReceivedEvent ...
 func (r *RoundInfo) AddReceivedEvent(x string) {
 	r.ReceivedEvents = append(r.ReceivedEvents, x)
 }
 
+// SetFame ...
 func (r *RoundInfo) SetFame(x string, f bool) {
 	e, ok := r.CreatedEvents[x]
 	if !ok {
@@ -67,9 +60,9 @@ func (r *RoundInfo) SetFame(x string, f bool) {
 	}
 
 	if f {
-		e.Famous = True
+		e.Famous = common.True
 	} else {
-		e.Famous = False
+		e.Famous = common.False
 	}
 
 	r.CreatedEvents[x] = e
@@ -90,9 +83,9 @@ func (r *RoundInfo) WitnessesDecided(peerSet *peers.PeerSet) bool {
 
 	c := 0
 	for _, e := range r.CreatedEvents {
-		if e.Witness && e.Famous != Undefined {
+		if e.Witness && e.Famous != common.Undefined {
 			c++
-		} else if e.Witness && e.Famous == Undefined {
+		} else if e.Witness && e.Famous == common.Undefined {
 			return false
 		}
 	}
@@ -102,7 +95,7 @@ func (r *RoundInfo) WitnessesDecided(peerSet *peers.PeerSet) bool {
 	return r.decided
 }
 
-//return witnesses
+//Witnesses return witnesses
 func (r *RoundInfo) Witnesses() []string {
 	res := []string{}
 	for x, e := range r.CreatedEvents {
@@ -114,22 +107,24 @@ func (r *RoundInfo) Witnesses() []string {
 	return res
 }
 
-//return famous witnesses
+//FamousWitnesses returns famous witnesses
 func (r *RoundInfo) FamousWitnesses() []string {
 	res := []string{}
 	for x, e := range r.CreatedEvents {
-		if e.Witness && e.Famous == True {
+		if e.Witness && e.Famous == common.True {
 			res = append(res, x)
 		}
 	}
 	return res
 }
 
+// IsDecided ...
 func (r *RoundInfo) IsDecided(witness string) bool {
 	w, ok := r.CreatedEvents[witness]
-	return ok && w.Witness && w.Famous != Undefined
+	return ok && w.Witness && w.Famous != common.Undefined
 }
 
+// Marshal ...
 func (r *RoundInfo) Marshal() ([]byte, error) {
 	b := new(bytes.Buffer)
 	jh := new(codec.JsonHandle)
@@ -143,6 +138,7 @@ func (r *RoundInfo) Marshal() ([]byte, error) {
 	return b.Bytes(), nil
 }
 
+// Unmarshal ...
 func (r *RoundInfo) Unmarshal(data []byte) error {
 	b := bytes.NewBuffer(data)
 	jh := new(codec.JsonHandle)
@@ -152,6 +148,7 @@ func (r *RoundInfo) Unmarshal(data []byte) error {
 	return dec.Decode(r)
 }
 
+// IsQueued ...
 func (r *RoundInfo) IsQueued() bool {
 	return r.queued
 }

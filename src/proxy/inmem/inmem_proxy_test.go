@@ -15,7 +15,7 @@ import (
 type TestProxy struct {
 	*InmemProxy
 	transactions [][]byte
-	logger       *logrus.Logger
+	logger       *logrus.Entry
 }
 
 func (p *TestProxy) CommitHandler(block hashgraph.Block) (proxy.CommitResponse, error) {
@@ -23,9 +23,16 @@ func (p *TestProxy) CommitHandler(block hashgraph.Block) (proxy.CommitResponse, 
 
 	p.transactions = append(p.transactions, block.Transactions()...)
 
-	response := proxy.CommitResponse{
-		StateHash: []byte("statehash"),
+	receipts := []hashgraph.InternalTransactionReceipt{}
+	for _, it := range block.InternalTransactions() {
+		receipts = append(receipts, it.AsAccepted())
 	}
+
+	response := proxy.CommitResponse{
+		StateHash:                   []byte("statehash"),
+		InternalTransactionReceipts: receipts,
+	}
+
 	return response, nil
 }
 
@@ -42,7 +49,7 @@ func (p *TestProxy) RestoreHandler(snapshot []byte) ([]byte, error) {
 }
 
 func NewTestProxy(t *testing.T) *TestProxy {
-	logger := common.NewTestLogger(t)
+	logger := common.NewTestEntry(t, common.TestLogLevel)
 
 	proxy := &TestProxy{
 		transactions: [][]byte{},
@@ -87,7 +94,7 @@ func TestInmemProxyBabbleSide(t *testing.T) {
 		[]byte("tx 3"),
 	}
 
-	block := hashgraph.NewBlock(0, 1, []byte{}, []*peers.Peer{}, transactions)
+	block := hashgraph.NewBlock(0, 1, []byte{}, []*peers.Peer{}, transactions, []hashgraph.InternalTransaction{})
 
 	/***************************************************************************
 	Commit

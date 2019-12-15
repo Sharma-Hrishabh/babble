@@ -1,7 +1,7 @@
-BABBLE_VERSION=0.4.1
-DUMMY_VERSION=0.4.1
+BABBLE_VERSION=0.5.12
+DUMMY_VERSION=0.5.7
 WATCHER_VERSION=0.0.2
-GLIDER_VERSION=0.0.2
+GLIDER_VERSION=0.0.4
 
 all: babble-image dummy-image watcher-image glider-image
 
@@ -16,7 +16,7 @@ babble-image:
 dummy-image:
 	CGO_ENABLED=0 go build \
 		-o dummy/dummy ../cmd/dummy/
-	docker build --no-cache=true -t mosaicnetworks/dummy:$(DUMMY_VERSION) dummy/
+	docker build --no-cache=true -t mosaicnetworks/dummy:$(DUMMY_VERSION) -t mosaicnetworks/dummy:latest dummy/
 
 watcher-image:
 	docker build --no-cache=true -t mosaicnetworks/watcher:$(WATCHER_VERSION) -t mosaicnetworks/watcher:latest watcher/

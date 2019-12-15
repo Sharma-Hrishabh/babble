@@ -6,44 +6,54 @@ import (
 	"time"
 
 	"github.com/mosaicnetworks/babble/src/common"
+	"github.com/mosaicnetworks/babble/src/config"
 	hg "github.com/mosaicnetworks/babble/src/hashgraph"
 	"github.com/mosaicnetworks/babble/src/net"
 	dummy "github.com/mosaicnetworks/babble/src/proxy/dummy"
 )
 
 func TestProcessSync(t *testing.T) {
-	keys, p := initPeers(2)
-	testLogger := common.NewTestLogger(t)
-	config := TestConfig(t)
+	keys, p := initPeers(t, 2)
+	config := config.NewTestConfig(t, common.TestLogLevel)
 
 	//Start two nodes
 
 	peers := p.Peers
 
-	peer0Trans, err := net.NewTCPTransport(peers[0].NetAddr, nil, 2, time.Second, testLogger)
+	peer0Trans, err := net.NewTCPTransport(peers[0].NetAddr, "", 2, time.Second, time.Second, config.Logger())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	go peer0Trans.Listen()
 	defer peer0Trans.Close()
 
-	node0 := NewNode(config, peers[0].ID(), keys[0], p,
+	genesisPeerSet := clonePeerSet(t, p.Peers)
+
+	node0 := NewNode(config,
+		NewValidator(keys[0], peers[0].Moniker),
+		p,
+		genesisPeerSet,
 		hg.NewInmemStore(config.CacheSize),
 		peer0Trans,
-		dummy.NewInmemDummyClient(testLogger))
+		dummy.NewInmemDummyClient(common.NewTestEntry(t, common.TestLogLevel)))
 	node0.Init()
 
 	node0.RunAsync(false)
 
-	peer1Trans, err := net.NewTCPTransport(peers[1].NetAddr, nil, 2, time.Second, testLogger)
+	peer1Trans, err := net.NewTCPTransport(peers[1].NetAddr, "", 2, time.Second, time.Second, config.Logger())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	go peer1Trans.Listen()
 	defer peer1Trans.Close()
 
-	node1 := NewNode(config, peers[1].ID(), keys[1], p,
+	node1 := NewNode(config,
+		NewValidator(keys[1], peers[1].Moniker),
+		p,
+		genesisPeerSet,
 		hg.NewInmemStore(config.CacheSize),
 		peer1Trans,
-		dummy.NewInmemDummyClient(testLogger))
+		dummy.NewInmemDummyClient(common.NewTestEntry(t, common.TestLogLevel)))
 	node1.Init()
 
 	node1.RunAsync(false)
@@ -64,11 +74,12 @@ func TestProcessSync(t *testing.T) {
 	}
 
 	args := net.SyncRequest{
-		FromID: node0.id,
-		Known:  node0KnownEvents,
+		FromID:    node0.core.validator.ID(),
+		SyncLimit: node0.conf.SyncLimit,
+		Known:     node0KnownEvents,
 	}
 	expectedResp := net.SyncResponse{
-		FromID: node1.id,
+		FromID: node1.core.validator.ID(),
 		Events: unknownWireEvents,
 		Known:  node1KnownEvents,
 	}
@@ -108,38 +119,47 @@ func TestProcessSync(t *testing.T) {
 }
 
 func TestProcessEagerSync(t *testing.T) {
-	keys, p := initPeers(2)
-	testLogger := common.NewTestLogger(t)
-	config := TestConfig(t)
+	keys, p := initPeers(t, 2)
+	config := config.NewTestConfig(t, common.TestLogLevel)
 
 	//Start two nodes
 
 	peers := p.Peers
 
-	peer0Trans, err := net.NewTCPTransport(peers[0].NetAddr, nil, 2, time.Second, testLogger)
+	peer0Trans, err := net.NewTCPTransport(peers[0].NetAddr, "", 2, time.Second, time.Second, config.Logger())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	go peer0Trans.Listen()
 	defer peer0Trans.Close()
 
-	node0 := NewNode(config, peers[0].ID(), keys[0], p,
+	genesisPeerSet := clonePeerSet(t, p.Peers)
+
+	node0 := NewNode(config,
+		NewValidator(keys[0], peers[0].Moniker),
+		p,
+		genesisPeerSet,
 		hg.NewInmemStore(config.CacheSize),
 		peer0Trans,
-		dummy.NewInmemDummyClient(testLogger))
+		dummy.NewInmemDummyClient(common.NewTestEntry(t, common.TestLogLevel)))
 	node0.Init()
 
 	node0.RunAsync(false)
 
-	peer1Trans, err := net.NewTCPTransport(peers[1].NetAddr, nil, 2, time.Second, testLogger)
+	peer1Trans, err := net.NewTCPTransport(peers[1].NetAddr, "", 2, time.Second, time.Second, config.Logger())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	go peer1Trans.Listen()
 	defer peer1Trans.Close()
 
-	node1 := NewNode(config, peers[1].ID(), keys[1], p,
+	node1 := NewNode(config,
+		NewValidator(keys[1], peers[1].Moniker),
+		p,
+		genesisPeerSet,
 		hg.NewInmemStore(config.CacheSize),
 		peer1Trans,
-		dummy.NewInmemDummyClient(testLogger))
+		dummy.NewInmemDummyClient(common.NewTestEntry(t, common.TestLogLevel)))
 	node1.Init()
 
 	node1.RunAsync(false)
@@ -159,11 +179,11 @@ func TestProcessEagerSync(t *testing.T) {
 	}
 
 	args := net.EagerSyncRequest{
-		FromID: node0.id,
+		FromID: node0.core.validator.ID(),
 		Events: unknownWireEvents,
 	}
 	expectedResp := net.EagerSyncResponse{
-		FromID:  node1.id,
+		FromID:  node1.core.validator.ID(),
 		Success: true,
 	}
 
@@ -184,38 +204,47 @@ func TestProcessEagerSync(t *testing.T) {
 }
 
 func TestProcessFastForward(t *testing.T) {
-	keys, p := initPeers(2)
-	testLogger := common.NewTestLogger(t)
-	config := TestConfig(t)
+	keys, p := initPeers(t, 2)
+	config := config.NewTestConfig(t, common.TestLogLevel)
 
 	//Start two nodes
 
 	peers := p.Peers
 
-	peer0Trans, err := net.NewTCPTransport(peers[0].NetAddr, nil, 2, time.Second, testLogger)
+	peer0Trans, err := net.NewTCPTransport(peers[0].NetAddr, "", 2, time.Second, time.Second, config.Logger())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	go peer0Trans.Listen()
 	defer peer0Trans.Close()
 
-	node0 := NewNode(config, peers[0].ID(), keys[0], p,
+	genesisPeerSet := clonePeerSet(t, p.Peers)
+
+	node0 := NewNode(config,
+		NewValidator(keys[0], peers[0].Moniker),
+		p,
+		genesisPeerSet,
 		hg.NewInmemStore(config.CacheSize),
 		peer0Trans,
-		dummy.NewInmemDummyClient(testLogger))
+		dummy.NewInmemDummyClient(common.NewTestEntry(t, common.TestLogLevel)))
 	node0.Init()
 
 	node0.RunAsync(false)
 
-	peer1Trans, err := net.NewTCPTransport(peers[1].NetAddr, nil, 2, time.Second, testLogger)
+	peer1Trans, err := net.NewTCPTransport(peers[1].NetAddr, "", 2, time.Second, time.Second, config.Logger())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	go peer1Trans.Listen()
 	defer peer1Trans.Close()
 
-	node1 := NewNode(config, peers[1].ID(), keys[1], p,
+	node1 := NewNode(config,
+		NewValidator(keys[1], peers[1].Moniker),
+		p,
+		genesisPeerSet,
 		hg.NewInmemStore(config.CacheSize),
 		peer1Trans,
-		dummy.NewInmemDummyClient(testLogger))
+		dummy.NewInmemDummyClient(common.NewTestEntry(t, common.TestLogLevel)))
 	node1.Init()
 
 	node1.RunAsync(false)
@@ -223,7 +252,7 @@ func TestProcessFastForward(t *testing.T) {
 	//Manually prepare FastForwardRequest. We expect a 'No Anchor Block' error
 
 	args := net.FastForwardRequest{
-		FromID: node0.id,
+		FromID: node0.core.validator.ID(),
 	}
 
 	//Make actual FastForwardRequest and check FastForwardResponse

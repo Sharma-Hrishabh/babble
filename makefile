@@ -2,7 +2,7 @@ BUILD_TAGS?=babble
 
 # vendor uses Glide to install all the Go dependencies in vendor/
 vendor:
-	glide install
+	(rm glide.lock || rm -rf vendor ) && glide install
 
 # install compiles and places the binary in GOPATH/bin
 install:
@@ -20,7 +20,22 @@ build:
 dist:
 	@BUILD_TAGS='$(BUILD_TAGS)' sh -c "'$(CURDIR)/scripts/dist.sh'"
 
-test:
-	glide novendor | xargs go test -count=1
+tests:  test
 
-.PHONY: vendor install build dist test
+test:
+	glide novendor | xargs go test -count=1 -tags=unit
+
+flagtest:
+	glide novendor | xargs go test -count=1 -run TestFlagEmpty
+
+extratests:
+	glide novendor | xargs go test -count=1 -run Extra
+
+alltests:
+	glide novendor | xargs go test -count=1 
+
+ 
+lint:
+	glide novendor | xargs golint
+
+.PHONY: vendor install build dist test flagtest extratests alltests tests lint

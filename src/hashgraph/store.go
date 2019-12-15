@@ -2,21 +2,21 @@ package hashgraph
 
 import "github.com/mosaicnetworks/babble/src/peers"
 
+// Store ...
 type Store interface {
 	CacheSize() int
 	GetPeerSet(int) (*peers.PeerSet, error)
 	SetPeerSet(int, *peers.PeerSet) error
-	GetFuturePeerSets(int) (map[int][]*peers.Peer, error)
-	AddParticipant(*peers.Peer) error
+	GetAllPeerSets() (map[int][]*peers.Peer, error)
+	FirstRound(uint32) (int, bool)
 	RepertoireByPubKey() map[string]*peers.Peer
 	RepertoireByID() map[uint32]*peers.Peer
-	RootsBySelfParent() map[string]*Root
 	GetEvent(string) (*Event, error)
 	SetEvent(*Event) error
 	ParticipantEvents(string, int) ([]string, error)
 	ParticipantEvent(string, int) (string, error)
-	LastEventFrom(string) (string, bool, error)
-	LastConsensusEventFrom(string) (string, bool, error)
+	LastEventFrom(string) (string, error)
+	LastConsensusEventFrom(string) (string, error)
 	KnownEvents() map[uint32]int
 	ConsensusEvents() []string
 	ConsensusEventsCount() int
@@ -34,6 +34,5 @@ type Store interface {
 	SetFrame(*Frame) error
 	Reset(*Frame) error
 	Close() error
-	NeedBoostrap() bool // Was the store loaded from existing db
 	StorePath() string
 }

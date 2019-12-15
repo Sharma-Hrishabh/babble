@@ -11,14 +11,16 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// SocketAppProxyClient ...
 type SocketAppProxyClient struct {
 	clientAddr string
 	timeout    time.Duration
-	logger     *logrus.Logger
+	logger     *logrus.Entry
 	rpc        *rpc.Client
 }
 
-func NewSocketAppProxyClient(clientAddr string, timeout time.Duration, logger *logrus.Logger) *SocketAppProxyClient {
+// NewSocketAppProxyClient ...
+func NewSocketAppProxyClient(clientAddr string, timeout time.Duration, logger *logrus.Entry) *SocketAppProxyClient {
 	return &SocketAppProxyClient{
 		clientAddr: clientAddr,
 		timeout:    timeout,
@@ -40,6 +42,7 @@ func (p *SocketAppProxyClient) getConnection() error {
 	return nil
 }
 
+// CommitBlock ...
 func (p *SocketAppProxyClient) CommitBlock(block hashgraph.Block) (proxy.CommitResponse, error) {
 	if err := p.getConnection(); err != nil {
 		return proxy.CommitResponse{}, err
@@ -61,6 +64,7 @@ func (p *SocketAppProxyClient) CommitBlock(block hashgraph.Block) (proxy.CommitR
 	return commitResponse, nil
 }
 
+// GetSnapshot ...
 func (p *SocketAppProxyClient) GetSnapshot(blockIndex int) ([]byte, error) {
 	if err := p.getConnection(); err != nil {
 		return []byte{}, err
@@ -82,6 +86,7 @@ func (p *SocketAppProxyClient) GetSnapshot(blockIndex int) ([]byte, error) {
 	return snapshot, nil
 }
 
+// Restore ...
 func (p *SocketAppProxyClient) Restore(snapshot []byte) error {
 	if err := p.getConnection(); err != nil {
 		return err

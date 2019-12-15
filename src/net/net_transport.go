@@ -31,7 +31,6 @@ var (
 )
 
 /*
-
 NetworkTransport provides a network based transport that can be
 used to communicate with babble on remote machines. It requires
 an underlying stream layer to provide a stream abstraction, which can
@@ -45,7 +44,7 @@ The response is an error string followed by the response object,
 both are encoded using msgpack
 */
 type NetworkTransport struct {
-	logger *logrus.Logger
+	logger *logrus.Entry
 
 	connPool     map[string][]*netConn
 	connPoolLock sync.Mutex
@@ -70,6 +69,9 @@ type StreamLayer interface {
 
 	// Dial is used to create a new outgoing connection
 	Dial(address string, timeout time.Duration) (net.Conn, error)
+
+	// AdvertiseAddr returns the publicly-reachable address of the stream
+	AdvertiseAddr() string
 }
 
 type netConn struct {
@@ -81,6 +83,7 @@ type netConn struct {
 	enc    *json.Encoder
 }
 
+// Release ...
 func (n *netConn) Release() error {
 	return n.conn.Close()
 }
@@ -92,22 +95,27 @@ func NewNetworkTransport(
 	stream StreamLayer,
 	maxPool int,
 	timeout time.Duration,
-	logger *logrus.Logger,
+	joinTimeout time.Duration,
+	logger *logrus.Entry,
 ) *NetworkTransport {
+
 	if logger == nil {
-		logger = logrus.New()
-		logger.Level = logrus.DebugLevel
+		log := logrus.New()
+		log.Level = logrus.DebugLevel
+		logger = logrus.NewEntry(log)
 	}
+
 	trans := &NetworkTransport{
-		connPool:   make(map[string][]*netConn),
-		consumeCh:  make(chan RPC),
-		logger:     logger,
-		maxPool:    maxPool,
-		shutdownCh: make(chan struct{}),
-		stream:     stream,
-		timeout:    timeout,
+		connPool:    make(map[string][]*netConn),
+		consumeCh:   make(chan RPC),
+		logger:      logger,
+		maxPool:     maxPool,
+		shutdownCh:  make(chan struct{}),
+		stream:      stream,
+		timeout:     timeout,
+		joinTimeout: joinTimeout,
 	}
-	go trans.listen()
+
 	return trans
 }
 
@@ -132,6 +140,11 @@ func (n *NetworkTransport) Consumer() <-chan RPC {
 // LocalAddr implements the Transport interface.
 func (n *NetworkTransport) LocalAddr() string {
 	return n.stream.Addr().String()
+}
+
+// AdvertiseAddr implements the Transport interface.
+func (n *NetworkTransport) AdvertiseAddr() string {
+	return n.stream.AdvertiseAddr()
 }
 
 // IsShutdown is used to check if the transport is shutdown.
@@ -219,6 +232,11 @@ func (n *NetworkTransport) FastForward(target string, args *FastForwardRequest, 
 	return n.genericRPC(target, rpcFastForward, n.timeout, args, resp)
 }
 
+// Join implements the Transport interface.
+func (n *NetworkTransport) Join(target string, args *JoinRequest, resp *JoinResponse) error {
+	return n.genericRPC(target, rpcJoin, n.joinTimeout, args, resp)
+}
+
 // genericRPC handles a simple request/response RPC.
 func (n *NetworkTransport) genericRPC(target string, rpcType uint8, timeout time.Duration, args interface{}, resp interface{}) error {
 	// Get a conn
@@ -290,8 +308,8 @@ func decodeResponse(conn *netConn, resp interface{}) (bool, error) {
 	return true, nil
 }
 
-// listen is used to handling incoming connections.
-func (n *NetworkTransport) listen() {
+// Listen opens the stream and handles incoming connections.
+func (n *NetworkTransport) Listen() {
 	for {
 		// Accept incoming connections
 		conn, err := n.stream.Accept()
@@ -322,8 +340,13 @@ func (n *NetworkTransport) handleConn(conn net.Conn) {
 
 	for {
 		if err := n.handleCommand(r, dec, enc); err != nil {
-			if err != io.EOF {
-				n.logger.WithField("error", err).Error("Failed to decode incoming command")
+
+			if err == ErrTransportShutdown {
+				n.logger.WithField("error", err).Warn("Failed to decode incoming command")
+			} else {
+				if err != io.EOF {
+					n.logger.WithField("error", err).Error("Failed to decode incoming command")
+				}
 			}
 			return
 		}
@@ -364,6 +387,12 @@ func (n *NetworkTransport) handleCommand(r *bufio.Reader, dec *json.Decoder, enc
 		rpc.Command = &req
 	case rpcFastForward:
 		var req FastForwardRequest
+		if err := dec.Decode(&req); err != nil {
+			return err
+		}
+		rpc.Command = &req
+	case rpcJoin:
+		var req JoinRequest
 		if err := dec.Decode(&req); err != nil {
 			return err
 		}
